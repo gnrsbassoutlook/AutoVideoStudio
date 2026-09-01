@@ -14,12 +14,14 @@ import random
 import shutil
 import string
 import datetime
-import traceback
+import subprocess
 import webbrowser
+import tempfile
+from pathlib import Path
 import gradio as gr
 
 # ==========================================
-# 0. 本地持久化配置管理
+# 0. 本地持久化配置管理与跨平台工具
 # ==========================================
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_config.json")
 
@@ -54,6 +56,51 @@ def save_config(cfg):
     except Exception as e:
         print(f"保存配置失败: {e}")
 
+def open_folder_in_explorer(file_or_dir_path):
+    """跨平台打开 Finder (Mac) 或 资源管理器 (Windows) 并定位高亮文件/文件夹"""
+    if not file_or_dir_path:
+        return
+    clean_path = str(file_or_dir_path).strip("'\"")
+    if not os.path.exists(clean_path):
+        return
+    try:
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", clean_path])
+        elif sys.platform == "win32":
+            if os.path.isdir(clean_path):
+                subprocess.run(["explorer", os.path.normpath(clean_path)])
+            else:
+                subprocess.run(["explorer", "/select,", os.path.normpath(clean_path)])
+        else:
+            folder = os.path.dirname(clean_path) if os.path.isfile(clean_path) else clean_path
+            subprocess.run(["xdg-open", folder])
+    except Exception as e:
+        print(f"打开文件夹失败: {e}")
+
+def resolve_input_path(path_str, file_obj):
+    """同时兼容：1. 手动/拖入真实文件路径; 2. 上传文件对象"""
+    if path_str and path_str.strip():
+        p = path_str.strip().strip("'\"").replace(r"\ ", " ")
+        if os.path.exists(p):
+            return p
+    if file_obj is not None:
+        return file_obj.name
+    return None
+
+def determine_out_path(source_file_path: str, suffix: str, ext: str, save_in_origin: bool) -> str:
+    """根据是否在原目录生成的勾选框决定保存路径"""
+    p = Path(source_file_path).resolve()
+    target_ext = ext if ext else p.suffix
+    if not target_ext.startswith('.'):
+        target_ext = '.' + target_ext
+    filename = f"{p.stem}{suffix}{target_ext}"
+    
+    if save_in_origin:
+        out_path = p.parent / filename
+    else:
+        out_path = Path(tempfile.gettempdir()) / filename
+    return str(out_path)
+
 # ==========================================
 # 1. 文本与字幕核心算法
 # ==========================================
@@ -72,8 +119,6 @@ PUNCT_ZH = {
     '¥', '℃', '々', '→', '↑', '↓', '←', '￣'
 }
 ALL_PUNCT_CHECK = (set(string.punctuation) | PUNCT_ZH) - KEEP_CHARS_PUNCT
-CHINESE_CHAR_REGEX = re.compile(r'[\u4e00-\u9fff]')
-ENTRY_START_REGEX = re.compile(r'^\s*[^\w\s]?\s*(\d+)\s*[:._\s]?\s*(.*)', re.MULTILINE)
 
 def get_effective_char_count(text):
     if not isinstance(text, str): return 0
@@ -110,10 +155,11 @@ def parse_srt_for_timing(filepath):
     entries.sort(key=lambda x: x['start_ms'])
     return entries, total_effective_chars
 
-def core_process_text_no_marks(file_obj):
-    if not file_obj:
-        return "请先上传 TXT 文件", "", None
-    filepath = file_obj.name
+def core_process_text_no_marks(path_str, file_obj, save_in_origin):
+    filepath = resolve_input_path(path_str, file_obj)
+    if not filepath or not os.path.exists(filepath):
+        return "请在输入框粘贴/拖入 TXT 文件路径，或上传 TXT 文件！", "", None, ""
+
     processed_lines = []
     line_count, blank_lines = 0, 0
     with open(filepath, 'r', encoding='utf-8-sig', errors='ignore') as infile:
@@ -127,71 +173,24 @@ def core_process_text_no_marks(file_obj):
             processed_lines.append(' '.join("".join(chars).split()))
 
     output_content = "\n".join(processed_lines)
-    base, _ = os.path.splitext(filepath)
-    out_path = f"{base}_No_Marks.txt"
-    with open(out_path, 'w', encoding='utf-8') as f:
+    out_path = determine_out_path(filepath, "_No_Marks", ".txt", save_in_origin)
+    with open(out_path, 'w', encoding='utf-8-sig') as f:
         f.write(output_content)
     
-    log = f"处理完成！原始行数: {line_count} | 移除空行: {blank_lines} | 保留行数: {len(processed_lines)}"
-    return log, output_content, out_path
+    loc_msg = f"原目录: {out_path}" if save_in_origin else f"临时缓存: {out_path}"
+    log = f"处理完成！原始行数: {line_count} | 移除空行: {blank_lines} | 保留行数: {len(processed_lines)}\n💾 文件已生成至 [{loc_msg}]"
+    return log, output_content, out_path, out_path
 
-def core_format_prompt(file_obj):
-    if not file_obj:
-        return "请先上传 TXT 文件", "", None
-    filepath = file_obj.name
-    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-        content = f.read()
+def core_merge_srt(srt_path_str, srt_file_obj, txt_path_str, txt_file_obj, save_in_origin):
+    srt_p = resolve_input_path(srt_path_str, srt_file_obj)
+    txt_p = resolve_input_path(txt_path_str, txt_file_obj)
+    if not srt_p or not txt_p or not os.path.exists(srt_p) or not os.path.exists(txt_p):
+        return "请同时提供 SRT 和 TXT 文件路径或上传文件！", "", None, ""
 
-    parts = ENTRY_START_REGEX.split("\n" + content.strip())
-    processed_entries = []
-    i = 1
-    while i < len(parts):
-        num_str = parts[i]
-        raw_title = parts[i+1].strip() if (i+1) < len(parts) else ""
-        raw_body = parts[i+2].strip() if (i+2) < len(parts) else ""
-        try:
-            formatted_num = f"{int(num_str):03d}"
-        except ValueError:
-            i += 3
-            continue
-
-        if CHINESE_CHAR_REGEX.search(raw_title):
-            cleaned_title = "".join(CHINESE_CHAR_REGEX.findall(raw_title)).strip()
-            final_body = raw_body
-        else:
-            translator = str.maketrans('', '', string.punctuation + '。、，；：？！‘’“”')
-            temp = raw_title.translate(translator)
-            words = ' '.join(temp.split()).split()
-            if 0 < len(words) <= 15:
-                cleaned_title = '_'.join(words)
-                final_body = raw_body
-            else:
-                cleaned_title = "无标题"
-                final_body = f"{raw_title} {raw_body}".strip()
-
-        cleaned_body = CHINESE_CHAR_REGEX.sub('', final_body)
-        cleaned_body = ' '.join(cleaned_body.replace('\r', ' ').replace('\n', ' ').split()).strip()
-        processed_entries.append(f"{formatted_num}.{cleaned_title}\n{cleaned_body}")
-        i += 3
-
-    if not processed_entries:
-        return "未能识别到序号格式段落，请检查文件！", "", None
-
-    output_content = "\n\n".join(processed_entries) + "\n"
-    base, _ = os.path.splitext(filepath)
-    out_path = f"{base}_prompt.txt"
-    with open(out_path, 'w', encoding='utf-8') as f:
-        f.write(output_content)
-
-    return f"提取完成！共生成 {len(processed_entries)} 个分镜条目。", output_content, out_path
-
-def core_merge_srt(srt_file, txt_file):
-    if not srt_file or not txt_file:
-        return "请同时上传 SRT 和 TXT 文件！", "", None
-    source_entries, src_chars = parse_srt_for_timing(srt_file.name)
+    source_entries, src_chars = parse_srt_for_timing(srt_p)
     
     lines_data, tgt_chars = [], 0
-    with io.open(txt_file.name, 'r', encoding='utf-8', errors='ignore') as f:
+    with io.open(txt_p, 'r', encoding='utf-8', errors='ignore') as f:
         for i, line in enumerate(f):
             raw = line.strip()
             if raw:
@@ -201,7 +200,7 @@ def core_merge_srt(srt_file, txt_file):
                     tgt_chars += eff_len
 
     if not source_entries or not lines_data:
-        return "解析文件失败，请检查文件内容！", "", None
+        return "解析文件失败，请检查文件内容！", "", None, ""
 
     final_entries = []
     source_srt_idx = 0
@@ -243,26 +242,28 @@ def core_merge_srt(srt_file, txt_file):
         final_entries.append(f"{target_idx + 1}\n{final_start} --> {final_end}\n{target_line['original']}")
 
     output_content = "\n\n".join(final_entries) + "\n\n"
-    base, _ = os.path.splitext(srt_file.name)
-    out_path = f"{base}_merged.srt"
-    with io.open(out_path, 'w', encoding='utf-8') as f:
+    out_path = determine_out_path(srt_p, "_merged", ".srt", save_in_origin)
+    with io.open(out_path, 'w', encoding='utf-8-sig') as f:
         f.write(output_content)
 
-    log = f"映射完成！共生成 {len(final_entries)} 条字幕。\n字符统计: 源SRT({src_chars}) vs 目标TXT({tgt_chars})"
-    return log, output_content, out_path
+    loc_msg = f"原SRT目录: {out_path}" if save_in_origin else f"临时缓存: {out_path}"
+    log = f"映射完成！共生成 {len(final_entries)} 条字幕。\n字符统计: 源SRT({src_chars}) vs 目标TXT({tgt_chars})\n💾 文件已生成至 [{loc_msg}]"
+    return log, output_content, out_path, out_path
 
-def core_inject_srt_duration_to_prompts(srt_file, txt_file, fps_str, time_unit, multiplier):
-    if not srt_file or not txt_file:
-        return "请同时上传 SRT 文件 和 提示词 TXT 文件！", "", None
+def core_inject_srt_duration_to_prompts(srt_path_str, srt_file_obj, txt_path_str, txt_file_obj, fps_str, time_unit, multiplier, save_in_origin):
+    srt_p = resolve_input_path(srt_path_str, srt_file_obj)
+    txt_p = resolve_input_path(txt_path_str, txt_file_obj)
+    if not srt_p or not txt_p or not os.path.exists(srt_p) or not os.path.exists(txt_p):
+        return "请同时提供 SRT 文件 和 TXT 文件路径或上传文件！", "", None, ""
 
     fps = float(fps_str)
     mult = float(multiplier)
     
-    srt_entries, _ = parse_srt_for_timing(srt_file.name)
+    srt_entries, _ = parse_srt_for_timing(srt_p)
     if not srt_entries:
-        return "SRT 文件解析失败或内容为空！", "", None
+        return "SRT 文件解析失败或内容为空！", "", None, ""
     
-    with open(txt_file.name, 'r', encoding='utf-8', errors='ignore') as f:
+    with open(txt_p, 'r', encoding='utf-8', errors='ignore') as f:
         raw_text = f.read()
 
     raw_blocks = [b.strip() for b in raw_text.strip().split('\n\n') if b.strip()]
@@ -319,16 +320,144 @@ def core_inject_srt_duration_to_prompts(srt_file, txt_file, fps_str, time_unit, 
             output_blocks.append(f"{item['title']}|未知时长\n{item['body']}")
 
     output_content = "\n\n".join(output_blocks) + "\n"
-    base, _ = os.path.splitext(txt_file.name)
-    out_path = f"{base}_with_duration.txt"
-    with open(out_path, 'w', encoding='utf-8') as f:
+    out_path = determine_out_path(txt_p, "_with_duration", ".txt", save_in_origin)
+    with open(out_path, 'w', encoding='utf-8-sig') as f:
         f.write(output_content)
 
     log_lines.append(f"🎉 处理完成！已成功注入 {process_len} 个分镜的时长参数（系数: {mult}x）。")
-    return "\n".join(log_lines), output_content, out_path
+    loc_msg = f"原TXT目录: {out_path}" if save_in_origin else f"临时缓存: {out_path}"
+    log_lines.append(f"💾 文件已生成至 [{loc_msg}]")
+    return "\n".join(log_lines), output_content, out_path, out_path
 
 # ==========================================
-# 2. 剪映草稿处理核心算法 (含全轨末尾吸附)
+# 2. 媒体文件智能整理与去重备份核心算法
+# ==========================================
+MEDIA_CATEGORY_EXTENSIONS = {
+    'doc': {'txt', 'doc', 'docx', 'md', 'json', 'py', 'pdf'},
+    'image': {'jpg', 'jpeg', 'png', 'psd', 'tiff'},
+    'audio': {'wav', 'mp3', 'wma', 'm4a', 'flac', 'ogg'},
+    'video': {'mp4', 'mov', 'm4v', 'mkv', 'avi'}
+}
+
+EXT_TO_CATEGORY = {}
+for cat, exts in MEDIA_CATEGORY_EXTENSIONS.items():
+    for ext in exts:
+        EXT_TO_CATEGORY[ext] = cat
+
+def clean_media_base_name(stem: str) -> str:
+    """循环剥离末尾的副本/序号特征：如 _0001, _1, -1, (1), _(1), 空格2, 副本 等"""
+    pattern = r'(_\d+|-\d+|\s+\d+|_\(\d+\)|\(\d+\)|\[\d+\]|[-_\s]*副本|\(副本\))$'
+    cur = stem
+    while True:
+        new_cur = re.sub(pattern, '', cur, flags=re.IGNORECASE).strip()
+        if new_cur == cur or not new_cur:
+            break
+        cur = new_cur
+    return cur if cur else stem
+
+def get_unique_target_path(target_folder: Path, filename: str) -> Path:
+    """若目标归档文件夹已存在同名文件，自动追加序号避免覆盖"""
+    dest = target_folder / filename
+    if not dest.exists():
+        return dest
+    name_stem = dest.stem
+    ext = dest.suffix
+    counter = 1
+    while True:
+        new_dest = target_folder / f"{name_stem}_dup{counter}{ext}"
+        if not new_dest.exists():
+            return new_dest
+        counter += 1
+
+def core_clean_media_folder(folder_path_str, mode_choice):
+    """
+    清理媒体文件夹：在待处理文件夹同级建立 doc_backup, image_backup, audio_backup, video_backup
+    """
+    if not folder_path_str or not folder_path_str.strip():
+        return "请先输入或拖入需要整理的文件夹路径！", ""
+    
+    clean_p = folder_path_str.strip().strip("'\"").replace(r"\ ", " ")
+    directory = Path(clean_p).expanduser().resolve()
+    if not directory.exists() or not directory.is_dir():
+        return f"❌ 错误: 路径不存在或不是文件夹: {clean_p}", ""
+
+    # 同级备份父目录
+    parent_dir = directory.parent
+
+    # 扫描该目录下的所有非隐藏单文件
+    file_list = []
+    try:
+        for item in directory.iterdir():
+            if item.is_dir() or item.name.startswith('.'):
+                continue
+            ext = item.suffix.lstrip('.').lower()
+            cat = EXT_TO_CATEGORY.get(ext, 'other')
+            base_name = clean_media_base_name(item.stem)
+            mtime = item.stat().st_mtime
+            file_list.append({
+                'path': item, 'filename': item.name, 'stem': item.stem,
+                'base_name': base_name, 'ext': ext, 'category': cat, 'mtime': mtime
+            })
+    except Exception as e:
+        return f"扫描文件夹出错: {e}", ""
+
+    if not file_list:
+        return "💡 该目录中没有可处理的文件！", str(parent_dir)
+
+    # 分组策略
+    groups = {}
+    for f in file_list:
+        if mode_choice.startswith("A"):
+            # 选项A：基准名 + 扩展名 (如: 01.钢琴.txt 与 01.钢琴-1.txt 归为一组)
+            key = (f['base_name'], f['ext'])
+        elif mode_choice.startswith("B"):
+            # 选项B：基准名 + 大类别 (如: 01.钢琴.mp3 与 01.钢琴.wav 归为一组)
+            key = (f['base_name'], f['category'])
+        else:
+            # 选项C：基准名占位 (如: 01.钢琴的所有类型归为一组)
+            key = f['base_name']
+        groups.setdefault(key, []).append(f)
+
+    to_keep = []
+    to_archive = []
+
+    for key, group_files in groups.items():
+        # 按修改时间降序排序（最新修改的文件排在最前面）
+        group_files.sort(key=lambda x: x['mtime'], reverse=True)
+        to_keep.append(group_files[0])
+        if len(group_files) > 1:
+            for old_file in group_files[1:]:
+                to_archive.append(old_file)
+
+    if not to_archive:
+        return f"🎉 扫描完毕！共检查 {len(file_list)} 个文件，均为最新唯一文件，无需清洗归档。", str(parent_dir)
+
+    # 执行移动到同级备份文件夹中
+    success_count = 0
+    log_details = []
+    for item in to_archive:
+        cat_name = item['category']
+        backup_folder_name = f"{cat_name}_backup"
+        target_dir = parent_dir / backup_folder_name
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        target_file_path = get_unique_target_path(target_dir, item['filename'])
+        shutil.move(str(item['path']), str(target_file_path))
+        success_count += 1
+        log_details.append(f" 📦 归档: [{item['filename']}] ➡️ [{backup_folder_name}/]")
+
+    summary_log = [
+        f"✅ 媒体清洗完成！",
+        f"📊 原始文件总数: {len(file_list)} | 🟢 原地保留最新: {len(to_keep)} | 📦 移动归档: {success_count}",
+        f"📁 备份文件已自动分发至同级备份目录: {parent_dir}",
+        "-" * 45,
+        "【归档详情列表】:"
+    ] + log_details
+
+    return "\n".join(summary_log), str(parent_dir)
+
+# ==========================================
+# 3. 剪映草稿处理核心算法
 # ==========================================
 def scan_jianying_projects(draft_dir):
     if not draft_dir or not os.path.exists(draft_dir):
@@ -357,8 +486,8 @@ def backup_draft_json(json_path, tag="backup"):
     shutil.copy2(json_path, backup_path)
     return backup_path
 
-def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_speed_limit=0.6):
-    """图文/视频轨道自动对齐（精准吸附全局音频最末尾）"""
+def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_speed_limit=0.6, snap_audio_boundary=True):
+    """图文/视频轨道自动对齐（精准吸附全局音频最末尾 + 音频断点自动截断）"""
     if not draft_dir or not project_name:
         return "请选择剪映草稿目录和工程名称！"
     
@@ -378,15 +507,27 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
     if not video_track or not text_track:
         return "错误：草稿中必须同时包含至少一条【主视频/图片轨道】和一条【文本/字幕轨道】！"
 
-    # 计算全局工程最大末尾时间（特别是音频轨道的终点）
+    audio_segments_bounds = []
     max_project_end = 0
     for t in tracks:
+        is_audio = (t.get("type") == "audio")
         for seg in t.get("segments", []):
             tg = seg.get("target_timerange", {})
             st = int(tg.get("start", 0))
             dt = int(tg.get("duration", 0))
-            if st + dt > max_project_end:
-                max_project_end = st + dt
+            ed = st + dt
+            if ed > max_project_end:
+                max_project_end = ed
+            if is_audio and dt > 0:
+                audio_segments_bounds.append((st, ed))
+
+    audio_segments_bounds.sort(key=lambda x: x[0])
+
+    def find_audio_bound_for_time(t):
+        for st, ed in audio_segments_bounds:
+            if st <= t < ed:
+                return st, ed
+        return None, None
 
     mat_videos_dict = {v["id"]: v for v in data.get("materials", {}).get("videos", [])}
     mat_speeds_dict = {s["id"]: s for s in data.get("materials", {}).get("speeds", [])}
@@ -426,14 +567,19 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
 
         if i < num_pairs - 1:
             next_t_start = int(t_segs[i+1].get("target_timerange", {}).get("start", curr_start))
-            dur = max(1, next_t_start - curr_start)
+            target_end = max(curr_start + 1, next_t_start)
         else:
-            # 最后一个片段：直接吸附至全工程的最末尾
             last_text_end = int(t_segs[i].get("target_timerange", {}).get("start", 0)) + int(t_segs[i].get("target_timerange", {}).get("duration", 1000000))
             final_target_end = max(max_project_end, last_text_end)
-            dur = max(1, final_target_end - curr_start)
+            target_end = max(curr_start + 1, final_target_end)
 
-        # ------------------ 情况 1: 图片素材 ------------------
+        if snap_audio_boundary and audio_segments_bounds:
+            a_st, a_ed = find_audio_bound_for_time(curr_start)
+            if a_ed is not None and target_end > a_ed:
+                target_end = a_ed
+
+        dur = max(1, target_end - curr_start)
+
         if mat_type == "photo":
             v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
             v["source_timerange"] = {"start": 0, "duration": int(dur)}
@@ -445,8 +591,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
             new_video_segments.append(v)
             curr_start += dur
             mod_count += 1
-
-        # ------------------ 情况 2: 视频素材 ------------------
         else:
             if raw_vid_dur >= dur:
                 v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
@@ -457,7 +601,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
                 mod_count += 1
             else:
                 calc_speed = raw_vid_dur / dur
-
                 if video_mode == "slow_down":
                     v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
                     v["source_timerange"] = {"start": 0, "duration": int(raw_vid_dur)}
@@ -465,7 +608,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
                     new_video_segments.append(v)
                     curr_start += dur
                     mod_count += 1
-
                 elif video_mode == "loop_copy":
                     rem_dur = dur
                     while rem_dur > 0:
@@ -479,7 +621,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
                         curr_start += take_dur
                         rem_dur -= take_dur
                         mod_count += 1
-
                 elif video_mode == "smart":
                     threshold = float(min_speed_limit)
                     if calc_speed >= threshold:
@@ -521,7 +662,8 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
     with open(draft_json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
-    return f"🎉 对齐成功！\n- 处理片段数: {mod_count}\n- 末尾已自动吸附全工程终点: {curr_start/1000000:.2f}秒\n- 自动备份: {os.path.basename(backup_path)}"
+    snap_msg = "（已启用音频断点截断）" if snap_audio_boundary else ""
+    return f"🎉 对齐成功！{snap_msg}\n- 处理片段数: {mod_count}\n- 末尾已自动吸附全工程终点: {curr_start/1000000:.2f}秒\n- 自动备份: {os.path.basename(backup_path)}"
 
 def core_add_keyframes_logic(draft_dir, project_name, zoom_min, zoom_max, pan_mag, auto_blur_bg=True):
     if not draft_dir or not project_name:
@@ -816,7 +958,7 @@ def core_generate_audio_title_track(draft_dir, project_name, split_char=".", fon
     return f"🎵 音频标题轨创建成功！\n- 新增 {len(new_text_segments)} 个标题卡片\n- 自动备份: {os.path.basename(backup_path)}"
 
 # ==========================================
-# 3. WebUI 界面构建 (两大清晰板块)
+# 4. WebUI 界面构建
 # ==========================================
 cfg = load_config()
 initial_projects = scan_jianying_projects(cfg.get("base_drafts_dir", ""))
@@ -828,61 +970,118 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
     
     with gr.Tabs():
         # ========================================================
-        # 板块一：文本与提示词处理中心
+        # 板块一：文本与媒体处理中心
         # ========================================================
-        with gr.TabItem("✂️ 文本与提示词处理中心"):
+        with gr.TabItem("✂️ 文本与媒体处理中心"):
+            gr.Markdown("💡 **使用提示**：从访达/资源管理器将文件或文件夹**直接拖入路径输入框**即可快速识别！")
+            
+            # --- 1. SRT 时长注入 ---
             gr.Markdown("### 📌 1. SRT 时间轴注入提示词时长 (ComfyUI 专用)")
             with gr.Row():
                 with gr.Column(scale=1):
-                    srt_time_in = gr.File(label="上传 SRT 字幕文件", file_types=[".srt"])
-                    prompt_txt_in = gr.File(label="上传提示词 TXT 文本", file_types=[".txt"])
+                    srt_path_in = gr.Textbox(label="SRT 文件路径 (可直接将文件拖拽至此)", placeholder="/Users/.../xxx.srt")
+                    srt_time_in = gr.File(label="或者点击上传 SRT 文件", file_types=[".srt"])
+                    prompt_path_in = gr.Textbox(label="提示词 TXT 路径 (可直接将文件拖拽至此)", placeholder="/Users/.../prompt.txt")
+                    prompt_txt_in = gr.File(label="或者点击上传 TXT 文本", file_types=[".txt"])
                     with gr.Row():
                         fps_select = gr.Dropdown(choices=["16", "24", "25", "30", "50", "60"], value="25", label="帧率 (FPS)")
                         unit_select = gr.Radio(choices=["帧数 (如 560f)", "秒数 (如 22.4s)"], value="帧数 (如 560f)", label="时长标记单位")
                     time_mult = gr.Slider(minimum=1.0, maximum=1.3, value=1.02, step=0.01, label="安全时长冗余系数 (默认 1.02x)")
-                    inject_btn = gr.Button("⚡ 开始计算并注入时长", variant="primary")
+                    origin_chk_1 = gr.Checkbox(value=True, label="在原目录生成")
+                    with gr.Row():
+                        inject_btn = gr.Button("⚡ 开始计算并注入", variant="primary", scale=2)
+                        inject_open_btn = gr.Button("📂 打开生成目录", scale=1)
                 with gr.Column(scale=1):
-                    inject_log = gr.Textbox(label="比对与校验日志", lines=3)
+                    inject_log = gr.Textbox(label="比对与校验日志", lines=4)
                     inject_preview = gr.Textbox(label="生成文本内容预览 (可直接点击全选复制)", lines=6)
-                    inject_out = gr.File(label="下载注入时长后的 TXT 文件")
+                    inject_out = gr.File(label="浏览器下载备用 (Downloads 目录)")
+                    inject_saved_path = gr.State("")
+
             inject_btn.click(
                 core_inject_srt_duration_to_prompts,
-                inputs=[srt_time_in, prompt_txt_in, fps_select, unit_select, time_mult],
-                outputs=[inject_log, inject_preview, inject_out]
+                inputs=[srt_path_in, srt_time_in, prompt_path_in, prompt_txt_in, fps_select, unit_select, time_mult, origin_chk_1],
+                outputs=[inject_log, inject_preview, inject_out, inject_saved_path]
             )
+            inject_open_btn.click(open_folder_in_explorer, inputs=[inject_saved_path], outputs=[])
 
             gr.Markdown("---")
+            # --- 2. 字幕映射 ---
             gr.Markdown("### 📌 2. 字幕按字数映射对齐 (SRT + TXT)")
             with gr.Row():
                 with gr.Column(scale=1):
-                    srt_in = gr.File(label="上传原始识别 SRT 文件", file_types=[".srt"])
-                    txt_in = gr.File(label="上传标准校对 TXT 文本", file_types=[".txt"])
-                    merge_btn = gr.Button("🔄 开始映射对齐字幕", variant="primary")
+                    srt_m_path = gr.Textbox(label="原始 SRT 文件路径 (拖入文件)", placeholder="/Users/.../source.srt")
+                    srt_in = gr.File(label="或者点击上传 SRT 文件", file_types=[".srt"])
+                    txt_m_path = gr.Textbox(label="校对 TXT 文件路径 (拖入文件)", placeholder="/Users/.../target.txt")
+                    txt_in = gr.File(label="或者点击上传 TXT 文件", file_types=[".txt"])
+                    origin_chk_2 = gr.Checkbox(value=True, label="在原目录生成")
+                    with gr.Row():
+                        merge_btn = gr.Button("🔄 开始映射对齐", variant="primary", scale=2)
+                        merge_open_btn = gr.Button("📂 打开生成目录", scale=1)
                 with gr.Column(scale=1):
-                    merge_log = gr.Textbox(label="对齐统计日志", lines=3)
+                    merge_log = gr.Textbox(label="对齐统计日志", lines=4)
                     merge_preview = gr.Textbox(label="生成 SRT 字幕预览 (可直接点击全选复制)", lines=6)
-                    merge_out = gr.File(label="下载对齐后的 SRT 文件")
-            merge_btn.click(core_merge_srt, inputs=[srt_in, txt_in], outputs=[merge_log, merge_preview, merge_out])
+                    merge_out = gr.File(label="浏览器下载备用 (Downloads 目录)")
+                    merge_saved_path = gr.State("")
+
+            merge_btn.click(
+                core_merge_srt, 
+                inputs=[srt_m_path, srt_in, txt_m_path, txt_in, origin_chk_2], 
+                outputs=[merge_log, merge_preview, merge_out, merge_saved_path]
+            )
+            merge_open_btn.click(open_folder_in_explorer, inputs=[merge_saved_path], outputs=[])
 
             gr.Markdown("---")
             with gr.Row():
-                with gr.Column(variant="panel"):
+                # --- 3. 文本清洗 ---
+                with gr.Column(variant="panel", scale=1):
                     gr.Markdown("### 📌 3. 文本符号清洗 (TTS 配音专用)")
-                    clean_in = gr.File(label="上传文稿 TXT", file_types=[".txt"])
-                    clean_btn = gr.Button("🧹 清洗标点符号", variant="primary")
-                    clean_log = gr.Textbox(label="清洗统计", lines=2)
+                    clean_path_in = gr.Textbox(label="文稿 TXT 路径 (直接拖拽文件至此)", placeholder="/Users/.../text.txt")
+                    clean_in = gr.File(label="或点击上传文稿 TXT", file_types=[".txt"])
+                    origin_chk_3 = gr.Checkbox(value=True, label="在原目录生成")
+                    with gr.Row():
+                        clean_btn = gr.Button("🧹 清洗标点符号", variant="primary", scale=2)
+                        clean_open_btn = gr.Button("📂 打开所在目录", scale=1)
+                    clean_log = gr.Textbox(label="清洗统计", lines=3)
                     clean_preview = gr.Textbox(label="清洗结果预览", lines=5)
-                    clean_out = gr.File(label="下载清洗后 TXT")
-                    clean_btn.click(core_process_text_no_marks, inputs=[clean_in], outputs=[clean_log, clean_preview, clean_out])
+                    clean_out = gr.File(label="浏览器下载备用 (Downloads 目录)")
+                    clean_saved_path = gr.State("")
 
-                with gr.Column(variant="panel"):
-                    gr.Markdown("### 📌 4. 提取分镜提示词 (绘图/视频生成)")
-                    fmt_in = gr.File(label="上传分镜脚本 TXT", file_types=[".txt"])
-                    fmt_btn = gr.Button("📑 提取分镜提示词", variant="primary")
-                    fmt_log = gr.Textbox(label="提取统计", lines=2)
-                    fmt_preview = gr.Textbox(label="提示词预览", lines=5)
-                    fmt_out = gr.File(label="下载 Prompt TXT")
-                    fmt_btn.click(core_format_prompt, inputs=[fmt_in], outputs=[fmt_log, fmt_preview, fmt_out])
+                    clean_btn.click(
+                        core_process_text_no_marks, 
+                        inputs=[clean_path_in, clean_in, origin_chk_3], 
+                        outputs=[clean_log, clean_preview, clean_out, clean_saved_path]
+                    )
+                    clean_open_btn.click(open_folder_in_explorer, inputs=[clean_saved_path], outputs=[])
+
+                # --- 4. 媒体文件智能整理 ---
+                with gr.Column(variant="panel", scale=1):
+                    gr.Markdown("### 📌 4. 媒体文件整理与去重备份 (留最新)")
+                    gr.Markdown("自动识别 `_0001`、`-(1)`、` 2`、`副本` 等后缀，将旧文件移至**同级备份目录**。")
+                    media_folder_in = gr.Textbox(
+                        label="待整理文件夹路径 (直接拖拽文件夹至此)", 
+                        placeholder="例如: /Users/xxx/Documents/Resource 或 D:\\Project\\Resource"
+                    )
+                    media_mode_radio = gr.Radio(
+                        choices=[
+                            "选项A: 同扩展名清洗（同名txt只留最新，不影响jpg/mp3等）",
+                            "选项B: 同大类清洗（同属audio/video/image/doc只留1个最新）",
+                            "选项C: 全局唯一占位（不管格式类型，该名称全目录只留1个最新）"
+                        ],
+                        value="选项A: 同扩展名清洗（同名txt只留最新，不影响jpg/mp3等）",
+                        label="清理规则"
+                    )
+                    with gr.Row():
+                        clean_media_btn = gr.Button("🗂️ 执行媒体去重并移动备份", variant="primary", scale=2)
+                        clean_media_open_btn = gr.Button("📂 打开备份所在目录", scale=1)
+                    media_clean_log = gr.Textbox(label="整理执行日志", lines=9)
+                    media_backup_dir_state = gr.State("")
+
+                    clean_media_btn.click(
+                        core_clean_media_folder,
+                        inputs=[media_folder_in, media_mode_radio],
+                        outputs=[media_clean_log, media_backup_dir_state]
+                    )
+                    clean_media_open_btn.click(open_folder_in_explorer, inputs=[media_backup_dir_state], outputs=[])
 
         # ========================================================
         # 板块二：剪映工程自动化处理
@@ -935,11 +1134,12 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                         label="短视频填充策略"
                     )
                     min_speed = gr.Slider(minimum=0.2, maximum=0.9, value=0.6, step=0.05, label="模式C降速下限阈值 (如 0.6x)")
+                    snap_audio_chk = gr.Checkbox(value=True, label="🎵 音频断点自动截断（上一素材截止于本音频尾部，下一素材从新音频头部开始）")
                     align_btn = gr.Button("⚡ 执行素材对齐字幕", variant="primary")
                     align_result = gr.Textbox(label="执行日志", lines=4)
                     align_btn.click(
                         core_align_media_logic, 
-                        inputs=[draft_path_input, project_dropdown, video_mode, min_speed], 
+                        inputs=[draft_path_input, project_dropdown, video_mode, min_speed, snap_audio_chk], 
                         outputs=[align_result]
                     )
 
@@ -1001,9 +1201,14 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                     )
 
 # ==========================================
-# 4. 启动入口
+# 5. 启动入口
 # ==========================================
 if __name__ == "__main__":
     port = 7860
+    if sys.platform == "win32":
+        allowed_list = [f"{d}:\\" for d in "CDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{d}:\\")]
+    else:
+        allowed_list = ["/"]
+        
     webbrowser.open(f"http://127.0.0.1:{port}")
-    demo.launch(server_name="127.0.0.1", server_port=port, inbrowser=False)
+    demo.launch(server_name="127.0.0.1", server_port=port, allowed_paths=allowed_list, inbrowser=False)
