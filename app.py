@@ -481,7 +481,7 @@ def backup_draft_json(json_path, tag="backup"):
 def inspect_draft_aspect_ratio(draft_dir, project_name):
     """辅助函数：检查当前草稿工程是横屏还是竖屏，返回推荐的 (target_y, target_font_size)"""
     if not draft_dir or not project_name:
-        return -0.246215, 12.0
+        return -0.25, 12.0
     project_dir = os.path.join(draft_dir, str(project_name))
     draft_json_path = get_draft_json_file(project_dir)
     if os.path.exists(draft_json_path):
@@ -493,12 +493,12 @@ def inspect_draft_aspect_ratio(draft_dir, project_name):
             height = canvas_cfg.get("height", 1080)
             is_vertical = (height > width) or (canvas_cfg.get("ratio") == "9:16")
             if is_vertical:
-                return -0.246215, 12.0
+                return -0.25, 12.0
             else:
-                return -0.676572, 5.0
+                return -0.68, 5.0
         except Exception:
             pass
-    return -0.246215, 12.0
+    return -0.25, 12.0
 
 def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_speed_limit=0.6, snap_audio_boundary=True):
     """图文/视频轨道自动对齐（精准吸附全局音频最末尾 + 音频断点自动截断）"""
@@ -769,7 +769,7 @@ def core_add_keyframes_logic(draft_dir, project_name, zoom_min, zoom_max, pan_ma
         height = canvas_cfg.get("height", 1080)
         is_vertical = (height > width) or (canvas_cfg.get("ratio") == "9:16")
 
-        default_auto_y = -0.246215 if is_vertical else -0.676572
+        default_auto_y = -0.25 if is_vertical else -0.68
         default_auto_size = 12.0 if is_vertical else 5.0
         ratio_desc = "9:16竖屏" if is_vertical else "16:9横屏"
 
