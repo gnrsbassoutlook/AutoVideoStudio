@@ -4,6 +4,9 @@
 
 ---
 
+写在最前面，一定要记得：
+chmod +x /Users/bd107c/Desktop/AutoVideoStudio/*.command
+
 ## ✨ 核心特性
 
 ### 1. ✂️ 文本与提示词处理中心

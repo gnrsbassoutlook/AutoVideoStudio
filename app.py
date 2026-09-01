@@ -381,10 +381,8 @@ def core_clean_media_folder(folder_path_str, mode_choice):
     if not directory.exists() or not directory.is_dir():
         return f"❌ 错误: 路径不存在或不是文件夹: {clean_p}", ""
 
-    # 同级备份父目录
     parent_dir = directory.parent
 
-    # 扫描该目录下的所有非隐藏单文件
     file_list = []
     try:
         for item in directory.iterdir():
@@ -404,17 +402,13 @@ def core_clean_media_folder(folder_path_str, mode_choice):
     if not file_list:
         return "💡 该目录中没有可处理的文件！", str(parent_dir)
 
-    # 分组策略
     groups = {}
     for f in file_list:
         if mode_choice.startswith("A"):
-            # 选项A：基准名 + 扩展名 (如: 01.钢琴.txt 与 01.钢琴-1.txt 归为一组)
             key = (f['base_name'], f['ext'])
         elif mode_choice.startswith("B"):
-            # 选项B：基准名 + 大类别 (如: 01.钢琴.mp3 与 01.钢琴.wav 归为一组)
             key = (f['base_name'], f['category'])
         else:
-            # 选项C：基准名占位 (如: 01.钢琴的所有类型归为一组)
             key = f['base_name']
         groups.setdefault(key, []).append(f)
 
@@ -422,7 +416,6 @@ def core_clean_media_folder(folder_path_str, mode_choice):
     to_archive = []
 
     for key, group_files in groups.items():
-        # 按修改时间降序排序（最新修改的文件排在最前面）
         group_files.sort(key=lambda x: x['mtime'], reverse=True)
         to_keep.append(group_files[0])
         if len(group_files) > 1:
@@ -432,7 +425,6 @@ def core_clean_media_folder(folder_path_str, mode_choice):
     if not to_archive:
         return f"🎉 扫描完毕！共检查 {len(file_list)} 个文件，均为最新唯一文件，无需清洗归档。", str(parent_dir)
 
-    # 执行移动到同级备份文件夹中
     success_count = 0
     log_details = []
     for item in to_archive:
@@ -485,6 +477,28 @@ def backup_draft_json(json_path, tag="backup"):
     backup_path = f"{json_path}.{tag}_{ts}.json"
     shutil.copy2(json_path, backup_path)
     return backup_path
+
+def inspect_draft_aspect_ratio(draft_dir, project_name):
+    """辅助函数：检查当前草稿工程是横屏还是竖屏，返回推荐的 (target_y, target_font_size)"""
+    if not draft_dir or not project_name:
+        return -0.246215, 12.0
+    project_dir = os.path.join(draft_dir, str(project_name))
+    draft_json_path = get_draft_json_file(project_dir)
+    if os.path.exists(draft_json_path):
+        try:
+            with open(draft_json_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            canvas_cfg = data.get("canvas_config", {})
+            width = canvas_cfg.get("width", 1920)
+            height = canvas_cfg.get("height", 1080)
+            is_vertical = (height > width) or (canvas_cfg.get("ratio") == "9:16")
+            if is_vertical:
+                return -0.246215, 12.0
+            else:
+                return -0.676572, 5.0
+        except Exception:
+            pass
+    return -0.246215, 12.0
 
 def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_speed_limit=0.6, snap_audio_boundary=True):
     """图文/视频轨道自动对齐（精准吸附全局音频最末尾 + 音频断点自动截断）"""
@@ -665,7 +679,10 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
     snap_msg = "（已启用音频断点截断）" if snap_audio_boundary else ""
     return f"🎉 对齐成功！{snap_msg}\n- 处理片段数: {mod_count}\n- 末尾已自动吸附全工程终点: {curr_start/1000000:.2f}秒\n- 自动备份: {os.path.basename(backup_path)}"
 
-def core_add_keyframes_logic(draft_dir, project_name, zoom_min, zoom_max, pan_mag, auto_blur_bg=True):
+def core_add_keyframes_logic(draft_dir, project_name, zoom_min, zoom_max, pan_mag, auto_blur_bg=True, auto_adapt_subtitles=True, custom_sub_y=None, custom_sub_size=None):
+    """
+    批量随机运镜 + 智能高斯模糊背景 + 自动适配/自定义调整白底黑框字幕样式与安全位置
+    """
     if not draft_dir or not project_name:
         return "请选择剪映草稿目录和工程名称！"
     
@@ -694,6 +711,7 @@ def core_add_keyframes_logic(draft_dir, project_name, zoom_min, zoom_max, pan_ma
             "time_offset": int(offset), "values": [float(val)]
         }
 
+    # 1. 批量运镜
     for seg in video_track.get("segments", []):
         mat_id = seg.get("material_id")
         video_mat = mat_videos_dict.get(mat_id, {})
@@ -737,16 +755,79 @@ def core_add_keyframes_logic(draft_dir, project_name, zoom_min, zoom_max, pan_ma
             })
         mod_count += 1
 
+    # 2. 高斯模糊背景填充
     if auto_blur_bg:
         for cv in data.get("materials", {}).get("canvases", []):
             cv["type"] = "canvas_blur"
             cv["blur"] = 0.0625
 
+    # 3. 智能/自定义适配白底黑框字幕样式
+    sub_msg = ""
+    if auto_adapt_subtitles:
+        canvas_cfg = data.get("canvas_config", {})
+        width = canvas_cfg.get("width", 1920)
+        height = canvas_cfg.get("height", 1080)
+        is_vertical = (height > width) or (canvas_cfg.get("ratio") == "9:16")
+
+        default_auto_y = -0.246215 if is_vertical else -0.676572
+        default_auto_size = 12.0 if is_vertical else 5.0
+        ratio_desc = "9:16竖屏" if is_vertical else "16:9横屏"
+
+        # 优先采用用户在 UI 滑块中微调的值
+        target_y = float(custom_sub_y) if custom_sub_y is not None else default_auto_y
+        target_font_size = float(custom_sub_size) if custom_sub_size is not None else default_auto_size
+
+        # 修改文本素材（应用预设第2个：白字黑框 + 统一字号 + 描边样式）
+        sub_count = 0
+        for txt in data.get("materials", {}).get("texts", []):
+            txt["font_size"] = float(target_font_size)
+            txt["text_color"] = "#ffffff"
+            txt["text_alpha"] = 1.0
+            txt["border_alpha"] = 1.0
+            txt["border_color"] = "#000000"
+            txt["border_width"] = 0.08
+            txt["line_max_width"] = 0.82
+            txt["alignment"] = 1
+            txt["use_effect_default_color"] = True
+
+            raw_content = txt.get("content", "")
+            if raw_content:
+                try:
+                    c_data = json.loads(raw_content)
+                    raw_text_str = c_data.get("text", "")
+                    text_len = len(raw_text_str)
+                    
+                    # 确保是标准白字加黑框样式
+                    c_data["styles"] = [{
+                        "fill": {"content": {"solid": {"color": [1.0, 1.0, 1.0]}}},
+                        "range": [0, text_len],
+                        "strokes": [{"width": 0.08, "content": {"solid": {"color": [0.0, 0.0, 0.0]}}}],
+                        "useLetterColor": True,
+                        "size": target_font_size,
+                        "font": {"path": "/Applications/VideoFusion-macOS.app/Contents/Resources/Font/SystemFont/zh-hans.ttf", "id": ""}
+                    }]
+                    txt["content"] = json.dumps(c_data, ensure_ascii=False)
+                except Exception:
+                    pass
+
+        # 统一所有字幕片段的垂直 Y 轴位置
+        for t in tracks:
+            if t.get("type") == "text":
+                for seg in t.get("segments", []):
+                    if "clip" not in seg or not isinstance(seg["clip"], dict):
+                        seg["clip"] = {"alpha": 1.0, "flip": {"horizontal": False, "vertical": False}, "rotation": 0.0, "scale": {"x": 1.0, "y": 1.0}, "transform": {"x": 0.0, "y": target_y}}
+                    else:
+                        seg["clip"].setdefault("transform", {})["y"] = target_y
+                        seg["clip"]["transform"]["x"] = 0.0
+                    sub_count += 1
+
+        sub_msg = f"\n- 💬 字幕样式优化: 识别为【{ratio_desc}】，已将 {sub_count} 个字幕统一设置为【白字黑框】（位置Y: {target_y:.4f}，字号: {target_font_size}）"
+
     with open(draft_json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
     bg_msg = "（已开启高斯模糊背景填充）" if auto_blur_bg else ""
-    return f"✨ 运镜添加成功！\n- 处理 {mod_count} 个图片片段 {bg_msg}\n- 自动跳过 {skipped_videos} 个原生视频\n- 自动备份: {os.path.basename(backup_path)}"
+    return f"✨ 运镜与字幕处理完成！\n- 处理 {mod_count} 个图片片段 {bg_msg}\n- 自动跳过 {skipped_videos} 个原生视频{sub_msg}\n- 自动备份: {os.path.basename(backup_path)}"
 
 def core_manage_video_audio_logic(draft_dir, project_name, action_type):
     if not draft_dir or not project_name:
@@ -964,6 +1045,7 @@ cfg = load_config()
 initial_projects = scan_jianying_projects(cfg.get("base_drafts_dir", ""))
 saved_proj = str(cfg.get("last_selected_project", ""))
 initial_proj_value = saved_proj if saved_proj in initial_projects else (initial_projects[0] if initial_projects else None)
+init_y, init_size = inspect_draft_aspect_ratio(cfg.get("base_drafts_dir", ""), initial_proj_value)
 
 with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
     gr.Markdown("# 🎙️ 智绘声影2.0+剪映自动视频工作台")
@@ -1103,22 +1185,6 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                     interactive=True
                 )
 
-            def refresh_project_list(path):
-                projs = scan_jianying_projects(path)
-                cur_cfg = load_config()
-                last_p = str(cur_cfg.get("last_selected_project", ""))
-                chosen = last_p if last_p in projs else (projs[0] if projs else None)
-                save_config({"base_drafts_dir": path, "last_selected_project": chosen or ""})
-                return gr.update(choices=projs, value=chosen)
-
-            def on_proj_change(path, proj):
-                if proj is not None:
-                    save_config({"base_drafts_dir": path, "last_selected_project": str(proj)})
-
-            draft_path_input.change(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown])
-            refresh_btn.click(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown])
-            project_dropdown.change(on_proj_change, inputs=[draft_path_input, project_dropdown], outputs=[])
-
             with gr.Row():
                 # 功能 1：图文/视频自动吸附
                 with gr.Column(variant="panel"):
@@ -1143,20 +1209,27 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                         outputs=[align_result]
                     )
 
-                # 功能 2：批量运镜
+                # 功能 2：批量运镜与白底黑框字幕优化
                 with gr.Column(variant="panel"):
-                    gr.Markdown("#### 2. ✨ 批量随机运镜 (仅图片)")
-                    gr.Markdown("动静分离处理，自动跳过原生视频。")
+                    gr.Markdown("#### 2. ✨ 批量随机运镜与字幕优化 (仅图片)")
+                    gr.Markdown("动静分离处理，自动跳过原生视频；智能适配横/竖屏【白字黑框】安全区。")
                     with gr.Row():
                         zoom_min = gr.Number(value=1.2, label="缩放小值", precision=2)
                         zoom_max = gr.Number(value=1.2, label="缩放大值", precision=2)
                         pan_mag = gr.Number(value=0.12, label="位移幅度", precision=2)
-                    blur_bg_chk = gr.Checkbox(value=True, label="🖼️ 开启高斯模糊背景填充 (防止黑边)")
-                    kf_btn = gr.Button("✨ 生成随机运镜关键帧", variant="primary")
-                    kf_result = gr.Textbox(label="运镜日志", lines=4)
+                    with gr.Row():
+                        blur_bg_chk = gr.Checkbox(value=True, label="🖼️ 高斯模糊背景填充")
+                        adapt_sub_chk = gr.Checkbox(value=True, label="💬 强制应用【白字黑框】并适配横/竖屏")
+                    
+                    with gr.Row():
+                        sub_y_slider = gr.Slider(minimum=-0.9, maximum=0.9, value=init_y, step=0.01, label="↕️ 上下位置调节 (Y轴: 负数靠下/正数靠上)")
+                        sub_size_slider = gr.Slider(minimum=3.0, maximum=25.0, value=init_size, step=0.5, label="🔤 字号大小调节")
+
+                    kf_btn = gr.Button("✨ 生成随机运镜与优化字幕", variant="primary")
+                    kf_result = gr.Textbox(label="运镜与字幕日志", lines=4)
                     kf_btn.click(
                         core_add_keyframes_logic, 
-                        inputs=[draft_path_input, project_dropdown, zoom_min, zoom_max, pan_mag, blur_bg_chk], 
+                        inputs=[draft_path_input, project_dropdown, zoom_min, zoom_max, pan_mag, blur_bg_chk, adapt_sub_chk, sub_y_slider, sub_size_slider], 
                         outputs=[kf_result]
                     )
 
@@ -1199,6 +1272,25 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                         inputs=[draft_path_input, project_dropdown, split_char, f_size1, f_size2, l_space, title_dur],
                         outputs=[title_result]
                     )
+
+            def refresh_project_list(path):
+                projs = scan_jianying_projects(path)
+                cur_cfg = load_config()
+                last_p = str(cur_cfg.get("last_selected_project", ""))
+                chosen = last_p if last_p in projs else (projs[0] if projs else None)
+                save_config({"base_drafts_dir": path, "last_selected_project": chosen or ""})
+                rec_y, rec_size = inspect_draft_aspect_ratio(path, chosen)
+                return gr.update(choices=projs, value=chosen), rec_y, rec_size
+
+            def on_proj_change(path, proj):
+                if proj is not None:
+                    save_config({"base_drafts_dir": path, "last_selected_project": str(proj)})
+                rec_y, rec_size = inspect_draft_aspect_ratio(path, proj)
+                return rec_y, rec_size
+
+            draft_path_input.change(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown, sub_y_slider, sub_size_slider])
+            refresh_btn.click(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown, sub_y_slider, sub_size_slider])
+            project_dropdown.change(on_proj_change, inputs=[draft_path_input, project_dropdown], outputs=[sub_y_slider, sub_size_slider])
 
 # ==========================================
 # 5. 启动入口
