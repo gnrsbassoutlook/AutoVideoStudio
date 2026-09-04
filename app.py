@@ -334,9 +334,9 @@ def core_inject_srt_duration_to_prompts(srt_path_str, srt_file_obj, txt_path_str
 # ==========================================
 MEDIA_CATEGORY_EXTENSIONS = {
     'doc': {'txt', 'doc', 'docx', 'md', 'json', 'py', 'pdf'},
-    'image': {'jpg', 'jpeg', 'png', 'psd', 'tiff'},
-    'audio': {'wav', 'mp3', 'wma', 'm4a', 'flac', 'ogg'},
-    'video': {'mp4', 'mov', 'm4v', 'mkv', 'avi'}
+    'image': {'jpg', 'jpeg', 'png', 'psd', 'tiff', 'webp'},
+    'audio': {'wav', 'mp3', 'wma', 'm4a', 'flac', 'ogg', 'aac'},
+    'video': {'mp4', 'mov', 'm4v', 'mkv', 'avi', 'flv'}
 }
 
 EXT_TO_CATEGORY = {}
@@ -355,6 +355,19 @@ def clean_media_base_name(stem: str) -> str:
         cur = new_cur
     return cur if cur else stem
 
+def extract_group_key(stem: str) -> str:
+    """
+    提取文件分组主键：
+    1. 优先提取前缀分镜序号（如 '01.演讲', '01_报告', '01-鼓掌' 均属于 '01' 组）
+    2. 若无序号前缀，则使用去除副本后缀后的主名（如 '报告'）
+    """
+    clean_stem = clean_media_base_name(stem)
+    # 匹配开头数字+分隔符，如 '01.', '01_', '01-', '01 '
+    match = re.match(r'^(\d+)[._\-\s]', clean_stem)
+    if match:
+        return f"prefix_{match.group(1)}"
+    return f"name_{clean_stem.lower()}"
+
 def get_unique_target_path(target_folder: Path, filename: str) -> Path:
     """若目标归档文件夹已存在同名文件，自动追加序号避免覆盖"""
     dest = target_folder / filename
@@ -369,9 +382,11 @@ def get_unique_target_path(target_folder: Path, filename: str) -> Path:
             return new_dest
         counter += 1
 
-def core_clean_media_folder(folder_path_str, mode_choice):
+def core_clean_media_folder(folder_path_str, mode_choice, retain_filter="all"):
     """
-    清理媒体文件夹：在待处理文件夹同级建立 doc_backup, image_backup, audio_backup, video_backup
+    清理媒体文件夹：
+    - 仅对存在多个类似/冲突文件的组合执行筛选去重
+    - 没有竞争的“独一份”文件（如 02.鼓掌.mp3, 03.散会.txt）绝对安全保留在原位！
     """
     if not folder_path_str or not folder_path_str.strip():
         return "请先输入或拖入需要整理的文件夹路径！", ""
@@ -391,10 +406,12 @@ def core_clean_media_folder(folder_path_str, mode_choice):
             ext = item.suffix.lstrip('.').lower()
             cat = EXT_TO_CATEGORY.get(ext, 'other')
             base_name = clean_media_base_name(item.stem)
+            group_key = extract_group_key(item.stem)
             mtime = item.stat().st_mtime
             file_list.append({
                 'path': item, 'filename': item.name, 'stem': item.stem,
-                'base_name': base_name, 'ext': ext, 'category': cat, 'mtime': mtime
+                'base_name': base_name, 'group_key': group_key,
+                'ext': ext, 'category': cat, 'mtime': mtime
             })
     except Exception as e:
         return f"扫描文件夹出错: {e}", ""
@@ -402,28 +419,64 @@ def core_clean_media_folder(folder_path_str, mode_choice):
     if not file_list:
         return "💡 该目录中没有可处理的文件！", str(parent_dir)
 
-    groups = {}
+    # 1. 按照冲突群组聚类
+    cluster_groups = {}
     for f in file_list:
-        if mode_choice.startswith("A"):
-            key = (f['base_name'], f['ext'])
-        elif mode_choice.startswith("B"):
-            key = (f['base_name'], f['category'])
-        else:
-            key = f['base_name']
-        groups.setdefault(key, []).append(f)
+        cluster_groups.setdefault(f['group_key'], []).append(f)
 
     to_keep = []
     to_archive = []
+    exempt_count = 0  # 独苗免清理计数
 
-    for key, group_files in groups.items():
-        group_files.sort(key=lambda x: x['mtime'], reverse=True)
-        to_keep.append(group_files[0])
-        if len(group_files) > 1:
-            for old_file in group_files[1:]:
-                to_archive.append(old_file)
+    for g_key, group_items in cluster_groups.items():
+        # 【关键判断】：如果没有类似/冲突文件（该分镜/主名只有这 1 个文件），绝不挪动，直接保留！
+        if len(group_items) == 1:
+            to_keep.append(group_items[0])
+            exempt_count += 1
+            continue
+
+        # 存在 2 个或以上竞争文件：进行规则筛选
+        if retain_filter != "all":
+            # 筛选出属于目标保留类型的文件
+            matched_items = [item for item in group_items if item['category'] == retain_filter]
+            
+            if matched_items:
+                # 目标类型存在：保留该类型中修改时间最新的 1 个
+                matched_items.sort(key=lambda x: x['mtime'], reverse=True)
+                to_keep.append(matched_items[0])
+                # 多余的同类型旧文件归档
+                for old in matched_items[1:]:
+                    to_archive.append(old)
+                # 冲突组里所有非目标类型的文件（如 txt/mp3/jpg）全部归档
+                for non_matched in group_items:
+                    if non_matched['category'] != retain_filter:
+                        to_archive.append(non_matched)
+            else:
+                # 冲突组里没有目标类型文件：退回普通去重策略，保留修改时间最新的 1 个，其他归档
+                group_items.sort(key=lambda x: x['mtime'], reverse=True)
+                to_keep.append(group_items[0])
+                for old in group_items[1:]:
+                    to_archive.append(old)
+        else:
+            # retain_filter == "all"：按照常规的 A/B/C 规则去重
+            sub_groups = {}
+            for f in group_items:
+                if mode_choice.startswith("A"):
+                    sub_k = (f['base_name'], f['ext'])
+                elif mode_choice.startswith("B"):
+                    sub_k = (f['base_name'], f['category'])
+                else:
+                    sub_k = f['base_name']
+                sub_groups.setdefault(sub_k, []).append(f)
+
+            for s_k, s_files in sub_groups.items():
+                s_files.sort(key=lambda x: x['mtime'], reverse=True)
+                to_keep.append(s_files[0])
+                for old in s_files[1:]:
+                    to_archive.append(old)
 
     if not to_archive:
-        return f"🎉 扫描完毕！共检查 {len(file_list)} 个文件，均为最新唯一文件，无需清洗归档。", str(parent_dir)
+        return f"🎉 扫描完毕！共检查 {len(file_list)} 个文件（其中 {exempt_count} 个独立无冲突文件已豁免保护），无需移动归档。", str(parent_dir)
 
     success_count = 0
     log_details = []
@@ -438,9 +491,10 @@ def core_clean_media_folder(folder_path_str, mode_choice):
         success_count += 1
         log_details.append(f" 📦 归档: [{item['filename']}] ➡️ [{backup_folder_name}/]")
 
+    filter_desc = f"【指定优先保留: {retain_filter.upper()}】" if retain_filter != 'all' else "【保留全部大类】"
     summary_log = [
-        f"✅ 媒体清洗完成！",
-        f"📊 原始文件总数: {len(file_list)} | 🟢 原地保留最新: {len(to_keep)} | 📦 移动归档: {success_count}",
+        f"✅ 媒体整理完成！{filter_desc}",
+        f"📊 总文件数: {len(file_list)} | 🟢 原地保留: {len(to_keep)} (含 {exempt_count} 个无冲突独立文件) | 📦 移动归档: {success_count}",
         f"📁 备份文件已自动分发至同级备份目录: {parent_dir}",
         "-" * 45,
         "【归档详情列表】:"
@@ -479,9 +533,9 @@ def backup_draft_json(json_path, tag="backup"):
     return backup_path
 
 def inspect_draft_aspect_ratio(draft_dir, project_name):
-    """辅助函数：检查当前草稿工程是横屏还是竖屏，返回推荐的 (target_y, target_font_size)"""
+    """辅助函数：检查当前草稿工程宽高比与推荐默认参数"""
     if not draft_dir or not project_name:
-        return -0.25, 12.0
+        return -600, 8.0, 115, 30
     project_dir = os.path.join(draft_dir, str(project_name))
     draft_json_path = get_draft_json_file(project_dir)
     if os.path.exists(draft_json_path):
@@ -489,19 +543,23 @@ def inspect_draft_aspect_ratio(draft_dir, project_name):
             with open(draft_json_path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             canvas_cfg = data.get("canvas_config", {})
-            width = canvas_cfg.get("width", 1920)
-            height = canvas_cfg.get("height", 1080)
+            width = canvas_cfg.get("width", 1080)
+            height = canvas_cfg.get("height", 1920)
             is_vertical = (height > width) or (canvas_cfg.get("ratio") == "9:16")
             if is_vertical:
-                return -0.25, 12.0
+                return -600, 8.0, 115, 30
             else:
-                return -0.68, 5.0
+                return -380, 5.0, 100, 30
         except Exception:
             pass
-    return -0.25, 12.0
+    return -600, 8.0, 115, 30
 
-def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_speed_limit=0.6, snap_audio_boundary=True):
-    """图文/视频轨道自动对齐（精准吸附全局音频最末尾 + 音频断点自动截断）"""
+def core_align_media_logic(draft_dir, project_name, video_mode="stretch_085", min_speed_limit=0.6, snap_audio_boundary=True):
+    """
+    图文/视频轨道自动对齐
+    - 支持智能判断双字幕轨（自动选用片段少的位置参考字幕轨）
+    - 支持模式D强行降速0.85倍填满，杜绝生视频尾部跳回首帧
+    """
     if not draft_dir or not project_name:
         return "请选择剪映草稿目录和工程名称！"
     
@@ -516,10 +574,20 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
 
     tracks = data.get("tracks", [])
     video_track = next((t for t in tracks if t.get("type") == "video"), None)
-    text_track = next((t for t in tracks if t.get("type") == "text"), None)
+    
+    # 智能识别多条字幕轨：自动选取片段数最匹配/较少的分镜对齐参考轨
+    text_tracks = [t for t in tracks if t.get("type") == "text" and len(t.get("segments", [])) > 0]
+    if not video_track or not text_tracks:
+        return "错误：草稿中必须包含至少一条【主视频/图片轨道】和一条【有效字幕轨道】！"
 
-    if not video_track or not text_track:
-        return "错误：草稿中必须同时包含至少一条【主视频/图片轨道】和一条【文本/字幕轨道】！"
+    track_log_info = ""
+    if len(text_tracks) == 1:
+        text_track = text_tracks[0]
+    else:
+        text_tracks.sort(key=lambda t: len(t.get("segments", [])))
+        text_track = text_tracks[0]
+        other_counts = [len(t.get("segments", [])) for t in text_tracks[1:]]
+        track_log_info = f"\n🎯 智能识别多条字幕轨: 已自动选用【分镜参考字幕轨】(共 {len(text_track.get('segments', []))} 段)，忽略高频台词轨({other_counts}段)"
 
     audio_segments_bounds = []
     max_project_end = 0
@@ -606,60 +674,84 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
             curr_start += dur
             mod_count += 1
         else:
-            if raw_vid_dur >= dur:
-                v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
-                v["source_timerange"] = {"start": 0, "duration": int(dur)}
-                set_speed_material(v, 1.0)
+            # 模式D：强行以0.85倍速慢放拉长，绝不循环拷贝
+            if video_mode == "stretch_085":
+                fixed_speed = 0.85
+                source_needed = int(dur * fixed_speed)
+                actual_source = min(raw_vid_dur, source_needed)
+                actual_dur = dur if raw_vid_dur >= source_needed else int(raw_vid_dur / fixed_speed)
+                
+                v["target_timerange"] = {"start": int(curr_start), "duration": int(actual_dur)}
+                v["source_timerange"] = {"start": 0, "duration": int(actual_source)}
+                set_speed_material(v, fixed_speed)
                 new_video_segments.append(v)
-                curr_start += dur
+                curr_start += actual_dur
+                
+                rem_dur = dur - actual_dur
+                if rem_dur > 0:
+                    clone_seg = json.loads(json.dumps(v))
+                    clone_seg["id"] = str(uuid.uuid4()).upper()
+                    clone_seg["target_timerange"] = {"start": int(curr_start), "duration": int(rem_dur)}
+                    clone_seg["source_timerange"] = {"start": 0, "duration": int(min(raw_vid_dur, int(rem_dur * fixed_speed)))}
+                    set_speed_material(clone_seg, fixed_speed)
+                    new_video_segments.append(clone_seg)
+                    curr_start += rem_dur
                 mod_count += 1
             else:
-                calc_speed = raw_vid_dur / dur
-                if video_mode == "slow_down":
+                if raw_vid_dur >= dur:
                     v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
-                    v["source_timerange"] = {"start": 0, "duration": int(raw_vid_dur)}
-                    set_speed_material(v, calc_speed)
+                    v["source_timerange"] = {"start": 0, "duration": int(dur)}
+                    set_speed_material(v, 1.0)
                     new_video_segments.append(v)
                     curr_start += dur
                     mod_count += 1
-                elif video_mode == "loop_copy":
-                    rem_dur = dur
-                    while rem_dur > 0:
-                        take_dur = min(rem_dur, raw_vid_dur)
-                        clone_seg = json.loads(json.dumps(v))
-                        clone_seg["id"] = str(uuid.uuid4()).upper()
-                        clone_seg["target_timerange"] = {"start": int(curr_start), "duration": int(take_dur)}
-                        clone_seg["source_timerange"] = {"start": 0, "duration": int(take_dur)}
-                        set_speed_material(clone_seg, 1.0)
-                        new_video_segments.append(clone_seg)
-                        curr_start += take_dur
-                        rem_dur -= take_dur
-                        mod_count += 1
-                elif video_mode == "smart":
-                    threshold = float(min_speed_limit)
-                    if calc_speed >= threshold:
+                else:
+                    calc_speed = raw_vid_dur / dur
+                    if video_mode == "slow_down":
                         v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
                         v["source_timerange"] = {"start": 0, "duration": int(raw_vid_dur)}
                         set_speed_material(v, calc_speed)
                         new_video_segments.append(v)
                         curr_start += dur
                         mod_count += 1
-                    else:
-                        slow_speed = threshold
-                        max_expanded_dur = int(raw_vid_dur / slow_speed)
+                    elif video_mode == "loop_copy":
                         rem_dur = dur
                         while rem_dur > 0:
-                            cur_target_dur = min(rem_dur, max_expanded_dur)
-                            cur_source_dur = int(cur_target_dur * slow_speed)
+                            take_dur = min(rem_dur, raw_vid_dur)
                             clone_seg = json.loads(json.dumps(v))
                             clone_seg["id"] = str(uuid.uuid4()).upper()
-                            clone_seg["target_timerange"] = {"start": int(curr_start), "duration": int(cur_target_dur)}
-                            clone_seg["source_timerange"] = {"start": 0, "duration": int(cur_source_dur)}
-                            set_speed_material(clone_seg, slow_speed)
+                            clone_seg["target_timerange"] = {"start": int(curr_start), "duration": int(take_dur)}
+                            clone_seg["source_timerange"] = {"start": 0, "duration": int(take_dur)}
+                            set_speed_material(clone_seg, 1.0)
                             new_video_segments.append(clone_seg)
-                            curr_start += cur_target_dur
-                            rem_dur -= cur_target_dur
+                            curr_start += take_dur
+                            rem_dur -= take_dur
                             mod_count += 1
+                    elif video_mode == "smart":
+                        threshold = float(min_speed_limit)
+                        if calc_speed >= threshold:
+                            v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
+                            v["source_timerange"] = {"start": 0, "duration": int(raw_vid_dur)}
+                            set_speed_material(v, calc_speed)
+                            new_video_segments.append(v)
+                            curr_start += dur
+                            mod_count += 1
+                        else:
+                            slow_speed = threshold
+                            max_expanded_dur = int(raw_vid_dur / slow_speed)
+                            rem_dur = dur
+                            while rem_dur > 0:
+                                cur_target_dur = min(rem_dur, max_expanded_dur)
+                                cur_source_dur = int(cur_target_dur * slow_speed)
+                                clone_seg = json.loads(json.dumps(v))
+                                clone_seg["id"] = str(uuid.uuid4()).upper()
+                                clone_seg["target_timerange"] = {"start": int(curr_start), "duration": int(cur_target_dur)}
+                                clone_seg["source_timerange"] = {"start": 0, "duration": int(cur_source_dur)}
+                                set_speed_material(clone_seg, slow_speed)
+                                new_video_segments.append(clone_seg)
+                                curr_start += cur_target_dur
+                                rem_dur -= cur_target_dur
+                                mod_count += 1
 
     if len(v_segs) > num_pairs:
         for i in range(num_pairs, len(v_segs)):
@@ -677,12 +769,10 @@ def core_align_media_logic(draft_dir, project_name, video_mode="smart", min_spee
         json.dump(data, f, ensure_ascii=False, indent=2)
 
     snap_msg = "（已启用音频断点截断）" if snap_audio_boundary else ""
-    return f"🎉 对齐成功！{snap_msg}\n- 处理片段数: {mod_count}\n- 末尾已自动吸附全工程终点: {curr_start/1000000:.2f}秒\n- 自动备份: {os.path.basename(backup_path)}"
+    return f"🎉 对齐成功！{snap_msg}{track_log_info}\n- 处理片段数: {mod_count}\n- 末尾已自动吸附全工程终点: {curr_start/1000000:.2f}秒\n- 自动备份: {os.path.basename(backup_path)}"
 
-def core_add_keyframes_logic(draft_dir, project_name, zoom_min, zoom_max, pan_mag, auto_blur_bg=True, auto_adapt_subtitles=True, custom_sub_y=None, custom_sub_size=None):
-    """
-    批量随机运镜 + 智能高斯模糊背景 + 自动适配/自定义调整白底黑框字幕样式与安全位置
-    """
+def core_add_keyframes_only_logic(draft_dir, project_name, zoom_min, zoom_max, pan_mag, auto_blur_bg=True):
+    """仅处理批量运镜与高斯模糊背景（纯净独立）"""
     if not draft_dir or not project_name:
         return "请选择剪映草稿目录和工程名称！"
     
@@ -711,7 +801,6 @@ def core_add_keyframes_logic(draft_dir, project_name, zoom_min, zoom_max, pan_ma
             "time_offset": int(offset), "values": [float(val)]
         }
 
-    # 1. 批量运镜
     for seg in video_track.get("segments", []):
         mat_id = seg.get("material_id")
         video_mat = mat_videos_dict.get(mat_id, {})
@@ -755,79 +844,102 @@ def core_add_keyframes_logic(draft_dir, project_name, zoom_min, zoom_max, pan_ma
             })
         mod_count += 1
 
-    # 2. 高斯模糊背景填充
     if auto_blur_bg:
         for cv in data.get("materials", {}).get("canvases", []):
             cv["type"] = "canvas_blur"
             cv["blur"] = 0.0625
 
-    # 3. 智能/自定义适配白底黑框字幕样式
-    sub_msg = ""
-    if auto_adapt_subtitles:
-        canvas_cfg = data.get("canvas_config", {})
-        width = canvas_cfg.get("width", 1920)
-        height = canvas_cfg.get("height", 1080)
-        is_vertical = (height > width) or (canvas_cfg.get("ratio") == "9:16")
-
-        default_auto_y = -0.25 if is_vertical else -0.68
-        default_auto_size = 12.0 if is_vertical else 5.0
-        ratio_desc = "9:16竖屏" if is_vertical else "16:9横屏"
-
-        # 优先采用用户在 UI 滑块中微调的值
-        target_y = float(custom_sub_y) if custom_sub_y is not None else default_auto_y
-        target_font_size = float(custom_sub_size) if custom_sub_size is not None else default_auto_size
-
-        # 修改文本素材（应用预设第2个：白字黑框 + 统一字号 + 描边样式）
-        sub_count = 0
-        for txt in data.get("materials", {}).get("texts", []):
-            txt["font_size"] = float(target_font_size)
-            txt["text_color"] = "#ffffff"
-            txt["text_alpha"] = 1.0
-            txt["border_alpha"] = 1.0
-            txt["border_color"] = "#000000"
-            txt["border_width"] = 0.08
-            txt["line_max_width"] = 0.82
-            txt["alignment"] = 1
-            txt["use_effect_default_color"] = True
-
-            raw_content = txt.get("content", "")
-            if raw_content:
-                try:
-                    c_data = json.loads(raw_content)
-                    raw_text_str = c_data.get("text", "")
-                    text_len = len(raw_text_str)
-                    
-                    # 确保是标准白字加黑框样式
-                    c_data["styles"] = [{
-                        "fill": {"content": {"solid": {"color": [1.0, 1.0, 1.0]}}},
-                        "range": [0, text_len],
-                        "strokes": [{"width": 0.08, "content": {"solid": {"color": [0.0, 0.0, 0.0]}}}],
-                        "useLetterColor": True,
-                        "size": target_font_size,
-                        "font": {"path": "/Applications/VideoFusion-macOS.app/Contents/Resources/Font/SystemFont/zh-hans.ttf", "id": ""}
-                    }]
-                    txt["content"] = json.dumps(c_data, ensure_ascii=False)
-                except Exception:
-                    pass
-
-        # 统一所有字幕片段的垂直 Y 轴位置
-        for t in tracks:
-            if t.get("type") == "text":
-                for seg in t.get("segments", []):
-                    if "clip" not in seg or not isinstance(seg["clip"], dict):
-                        seg["clip"] = {"alpha": 1.0, "flip": {"horizontal": False, "vertical": False}, "rotation": 0.0, "scale": {"x": 1.0, "y": 1.0}, "transform": {"x": 0.0, "y": target_y}}
-                    else:
-                        seg["clip"].setdefault("transform", {})["y"] = target_y
-                        seg["clip"]["transform"]["x"] = 0.0
-                    sub_count += 1
-
-        sub_msg = f"\n- 💬 字幕样式优化: 识别为【{ratio_desc}】，已将 {sub_count} 个字幕统一设置为【白字黑框】（位置Y: {target_y:.4f}，字号: {target_font_size}）"
-
     with open(draft_json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
     bg_msg = "（已开启高斯模糊背景填充）" if auto_blur_bg else ""
-    return f"✨ 运镜与字幕处理完成！\n- 处理 {mod_count} 个图片片段 {bg_msg}\n- 自动跳过 {skipped_videos} 个原生视频{sub_msg}\n- 自动备份: {os.path.basename(backup_path)}"
+    return f"✨ 运镜处理完成！\n- 成功为 {mod_count} 个图片片段生成随机关键帧 {bg_msg}\n- 自动识别并跳过 {skipped_videos} 个原生视频素材\n- 自动备份: {os.path.basename(backup_path)}"
+
+def core_subtitle_styling_logic(draft_dir, project_name, sub_pixel_y=-600, font_size=8.0, scale_pct=115, stroke_val=30):
+    """
+    独立板块3：字幕样式与效果高级定制（校准后的白底黑框、精准居中、真实像素Y坐标换算、标准描边粗细）
+    """
+    if not draft_dir or not project_name:
+        return "请选择剪映草稿目录和工程名称！"
+    
+    project_dir = os.path.join(draft_dir, str(project_name))
+    draft_json_path = get_draft_json_file(project_dir)
+    if not os.path.exists(draft_json_path):
+        return f"未找到工程配置文件: {draft_json_path}"
+
+    backup_path = backup_draft_json(draft_json_path, "sub_style_bak")
+    with open(draft_json_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    tracks = data.get("tracks", [])
+    canvas_cfg = data.get("canvas_config", {})
+    height = float(canvas_cfg.get("height", 1920))
+    
+    # 剪映界面显示的像素值 = norm_y * height，因此 norm_y = pixel_y / height
+    norm_y = float(sub_pixel_y) / height
+    target_scale = float(scale_pct) / 100.0
+    
+    # 描边粗细 30 对应底层实际值为 0.06 (即 30 * 0.002)
+    stroke_width_val = float(stroke_val) * 0.002
+    target_font_size = float(font_size)
+
+    # 1. 遍历 materials.texts 中的字号、预设白字黑边与段落居中属性
+    mod_text_count = 0
+    for txt in data.get("materials", {}).get("texts", []):
+        txt["font_size"] = target_font_size
+        txt["text_color"] = "#ffffff"
+        txt["text_alpha"] = 1.0
+        txt["border_alpha"] = 1.0
+        txt["border_color"] = "#000000"
+        txt["border_width"] = stroke_width_val
+        txt["alignment"] = 1                   # 居中对齐
+        txt["preset_has_set_alignment"] = True # 预设居中生效
+        txt["typesetting"] = 0                 # 横排
+        txt["use_effect_default_color"] = True
+
+        raw_content = txt.get("content", "")
+        if raw_content:
+            try:
+                c_data = json.loads(raw_content)
+                raw_text_str = c_data.get("text", "")
+                text_len = len(raw_text_str)
+                c_data["styles"] = [{
+                    "fill": {"content": {"solid": {"color": [1.0, 1.0, 1.0]}}},
+                    "range": [0, text_len],
+                    "strokes": [{"width": stroke_width_val, "content": {"solid": {"color": [0.0, 0.0, 0.0]}}}],
+                    "useLetterColor": True,
+                    "size": target_font_size,
+                    "font": {"path": "/Applications/VideoFusion-macOS.app/Contents/Resources/Font/SystemFont/zh-hans.ttf", "id": ""}
+                }]
+                txt["content"] = json.dumps(c_data, ensure_ascii=False)
+            except Exception:
+                pass
+        mod_text_count += 1
+
+    # 2. 统一 text 轨道上所有字幕片段的 (X=0.0居中, Y=norm_y, 缩放scale)
+    seg_count = 0
+    for t in tracks:
+        if t.get("type") == "text":
+            for seg in t.get("segments", []):
+                clip = seg.setdefault("clip", {})
+                clip["alpha"] = 1.0
+                clip["flip"] = {"horizontal": False, "vertical": False}
+                clip["rotation"] = 0.0
+                clip["scale"] = {"x": target_scale, "y": target_scale}
+                clip["transform"] = {"x": 0.0, "y": norm_y}
+                seg_count += 1
+
+    with open(draft_json_path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+    return (
+        f"💬 字幕效果处理完成！\n"
+        f"- 统一设置 {mod_text_count} 条字幕为标准【白底黑框】\n"
+        f"- 剪映界面实测参数校准: Y = {sub_pixel_y} (内部 norm_y: {norm_y:.4f})\n"
+        f"- 描边粗细: {stroke_val} (内部 width: {stroke_width_val:.4f}) | 字号: {target_font_size} | 缩放: {scale_pct}%\n"
+        f"- 已将 {seg_count} 个字幕片段水平完美居中 (X=0.0)\n"
+        f"- 自动备份: {os.path.basename(backup_path)}"
+    )
 
 def core_manage_video_audio_logic(draft_dir, project_name, action_type):
     if not draft_dir or not project_name:
@@ -998,7 +1110,7 @@ def core_generate_audio_title_track(draft_dir, project_name, split_char=".", fon
             "inner_padding": -1.0, "is_rich_text": False, "italic_degree": 0, "ktv_color": "", "language": "",
             "layer_weight": 1, "letter_spacing": 0.0, "line_feed": 1, "line_max_width": 0.82,
             "line_spacing": cur_line_spacing, "multi_language_current": "none", "name": "", "original_size": [],
-            "preset_category": "", "preset_category_id": "", "preset_has_set_alignment": False, "preset_id": "",
+            "preset_category": "", "preset_category_id": "", "preset_has_set_alignment": True, "preset_id": "",
             "preset_index": 0, "preset_name": "", "recognize_task_id": "", "recognize_type": 0, "relevance_segment": [],
             "shadow_alpha": 0.9, "shadow_angle": -45.0, "shadow_color": "", "shadow_distance": 5.0,
             "shadow_point": {"x": 0.6363961030678928, "y": -0.6363961030678927}, "shadow_smoothing": 0.45,
@@ -1045,7 +1157,7 @@ cfg = load_config()
 initial_projects = scan_jianying_projects(cfg.get("base_drafts_dir", ""))
 saved_proj = str(cfg.get("last_selected_project", ""))
 initial_proj_value = saved_proj if saved_proj in initial_projects else (initial_projects[0] if initial_projects else None)
-init_y, init_size = inspect_draft_aspect_ratio(cfg.get("base_drafts_dir", ""), initial_proj_value)
+init_y, init_size, init_scale, init_stroke = inspect_draft_aspect_ratio(cfg.get("base_drafts_dir", ""), initial_proj_value)
 
 with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
     gr.Markdown("# 🎙️ 智绘声影2.0+剪映自动视频工作台")
@@ -1138,11 +1250,23 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                 # --- 4. 媒体文件智能整理 ---
                 with gr.Column(variant="panel", scale=1):
                     gr.Markdown("### 📌 4. 媒体文件整理与去重备份 (留最新)")
-                    gr.Markdown("自动识别 `_0001`、`-(1)`、` 2`、`副本` 等后缀，将旧文件移至**同级备份目录**。")
+                    gr.Markdown("💡 **安全规则**：仅对出现类似/冲突同名的一组文件做处理；**无竞争的独一份文件（如 02、03）绝对不挪动，安全保留！**")
                     media_folder_in = gr.Textbox(
                         label="待整理文件夹路径 (直接拖拽文件夹至此)", 
                         placeholder="例如: /Users/xxx/Documents/Resource 或 D:\\Project\\Resource"
                     )
+                    with gr.Row():
+                        media_filter_radio = gr.Radio(
+                            choices=[
+                                ("保留全部大类", "all"),
+                                ("仅保留音频 (audio)", "audio"),
+                                ("仅保留视频 (video)", "video"),
+                                ("仅保留图片 (image)", "image"),
+                                ("仅保留文档 (doc)", "doc")
+                            ],
+                            value="all",
+                            label="🎯 目标保留文件类型"
+                        )
                     media_mode_radio = gr.Radio(
                         choices=[
                             "选项A: 同扩展名清洗（同名txt只留最新，不影响jpg/mp3等）",
@@ -1150,25 +1274,25 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                             "选项C: 全局唯一占位（不管格式类型，该名称全目录只留1个最新）"
                         ],
                         value="选项A: 同扩展名清洗（同名txt只留最新，不影响jpg/mp3等）",
-                        label="清理规则"
+                        label="去重策略规则"
                     )
                     with gr.Row():
-                        clean_media_btn = gr.Button("🗂️ 执行媒体去重并移动备份", variant="primary", scale=2)
+                        clean_media_btn = gr.Button("🗂️ 执行媒体整理归档", variant="primary", scale=2)
                         clean_media_open_btn = gr.Button("📂 打开备份所在目录", scale=1)
-                    media_clean_log = gr.Textbox(label="整理执行日志", lines=9)
+                    media_clean_log = gr.Textbox(label="整理执行日志", lines=8)
                     media_backup_dir_state = gr.State("")
 
                     clean_media_btn.click(
                         core_clean_media_folder,
-                        inputs=[media_folder_in, media_mode_radio],
+                        inputs=[media_folder_in, media_mode_radio, media_filter_radio],
                         outputs=[media_clean_log, media_backup_dir_state]
                     )
                     clean_media_open_btn.click(open_folder_in_explorer, inputs=[media_backup_dir_state], outputs=[])
 
         # ========================================================
-        # 板块二：剪映工程自动化处理
+        # 板块二：剪映工程自动化处理中心
         # ========================================================
-        with gr.TabItem("🎬 剪映工程自动化处理"):
+        with gr.TabItem("🎬 剪映工程自动化处理中心"):
             with gr.Accordion("📁 剪映草稿工程定位 (全局配置自动保存)", open=True):
                 with gr.Row():
                     draft_path_input = gr.Textbox(
@@ -1189,54 +1313,67 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                 # 功能 1：图文/视频自动吸附
                 with gr.Column(variant="panel"):
                     gr.Markdown("#### 1. 🖼️ 图文/视频自动吸附字幕")
-                    gr.Markdown("自动填满空隙，末尾吸附音频终点，杜绝黑屏。")
+                    gr.Markdown("💡 **智能双字幕识别**：自动选用分镜位置参考字幕轨，忽略细碎台词轨。")
                     video_mode = gr.Radio(
                         choices=[
+                            ("模式D: 强行降速拉长 (固定0.85x，杜绝首尾跳帧且无重复拷贝) [默认推荐]", "stretch_085"),
                             ("模式C: 智能降速+复制组合", "smart"),
                             ("模式A: 强制降速填满", "slow_down"),
                             ("模式B: 强制原速循环复制", "loop_copy")
                         ],
-                        value="smart",
-                        label="短视频填充策略"
+                        value="stretch_085",
+                        label="视频填充策略"
                     )
-                    min_speed = gr.Slider(minimum=0.2, maximum=0.9, value=0.6, step=0.05, label="模式C降速下限阈值 (如 0.6x)")
-                    snap_audio_chk = gr.Checkbox(value=True, label="🎵 音频断点自动截断（上一素材截止于本音频尾部，下一素材从新音频头部开始）")
+                    with gr.Row():
+                        min_speed = gr.Slider(minimum=0.2, maximum=0.9, value=0.6, step=0.05, label="模式C降速下限阈值 (如 0.6x)")
+                        snap_audio_chk = gr.Checkbox(value=True, label="🎵 音频断点自动截断（杜绝跨句越界）")
                     align_btn = gr.Button("⚡ 执行素材对齐字幕", variant="primary")
-                    align_result = gr.Textbox(label="执行日志", lines=4)
+                    align_result = gr.Textbox(label="执行日志", lines=5)
                     align_btn.click(
                         core_align_media_logic, 
                         inputs=[draft_path_input, project_dropdown, video_mode, min_speed, snap_audio_chk], 
                         outputs=[align_result]
                     )
 
-                # 功能 2：批量运镜与白底黑框字幕优化
+                # 功能 2：批量随机运镜 (仅图片)
                 with gr.Column(variant="panel"):
-                    gr.Markdown("#### 2. ✨ 批量随机运镜与字幕优化 (仅图片)")
-                    gr.Markdown("动静分离处理，自动跳过原生视频；智能适配横/竖屏【白字黑框】安全区。")
+                    gr.Markdown("#### 2. ✨ 批量随机运镜 (仅图片)")
+                    gr.Markdown("动静分离处理，自动跳过原生视频；自动生成推拉摇移关键帧。")
                     with gr.Row():
                         zoom_min = gr.Number(value=1.2, label="缩放小值", precision=2)
                         zoom_max = gr.Number(value=1.2, label="缩放大值", precision=2)
                         pan_mag = gr.Number(value=0.12, label="位移幅度", precision=2)
-                    with gr.Row():
-                        blur_bg_chk = gr.Checkbox(value=True, label="🖼️ 高斯模糊背景填充")
-                        adapt_sub_chk = gr.Checkbox(value=True, label="💬 强制应用【白字黑框】并适配横/竖屏")
-                    
-                    with gr.Row():
-                        sub_y_slider = gr.Slider(minimum=-0.9, maximum=0.9, value=init_y, step=0.01, label="↕️ 上下位置调节 (Y轴: 负数靠下/正数靠上)")
-                        sub_size_slider = gr.Slider(minimum=3.0, maximum=25.0, value=init_size, step=0.5, label="🔤 字号大小调节")
-
-                    kf_btn = gr.Button("✨ 生成随机运镜与优化字幕", variant="primary")
-                    kf_result = gr.Textbox(label="运镜与字幕日志", lines=4)
+                    blur_bg_chk = gr.Checkbox(value=True, label="🖼️ 开启高斯模糊背景填充 (防黑边)")
+                    kf_btn = gr.Button("✨ 生成随机运镜关键帧", variant="primary")
+                    kf_result = gr.Textbox(label="运镜日志", lines=5)
                     kf_btn.click(
-                        core_add_keyframes_logic, 
-                        inputs=[draft_path_input, project_dropdown, zoom_min, zoom_max, pan_mag, blur_bg_chk, adapt_sub_chk, sub_y_slider, sub_size_slider], 
+                        core_add_keyframes_only_logic, 
+                        inputs=[draft_path_input, project_dropdown, zoom_min, zoom_max, pan_mag, blur_bg_chk], 
                         outputs=[kf_result]
                     )
 
             with gr.Row():
-                # 功能 3：视频原声管理
+                # 功能 3：字幕效果处理（独立板块）
                 with gr.Column(variant="panel"):
-                    gr.Markdown("#### 3. 🔊 视频素材声音管理")
+                    gr.Markdown("#### 3. 💬 字幕效果与样式处理")
+                    gr.Markdown("强制应用【白底黑框】、居中对齐、精准调整 Y 轴安全区、缩放与描边粗细。")
+                    with gr.Row():
+                        sub_y_slider = gr.Slider(minimum=-900, maximum=900, value=init_y, step=10, label="↕️ 上下位置 Y (像素: 负数靠下 / 正数靠上)")
+                        sub_size_slider = gr.Slider(minimum=3.0, maximum=25.0, value=init_size, step=0.5, label="🔤 字号大小")
+                    with gr.Row():
+                        sub_scale_slider = gr.Slider(minimum=50, maximum=200, value=init_scale, step=1, label="🔍 缩放百分比 (如 115%)")
+                        sub_stroke_slider = gr.Slider(minimum=0, maximum=100, value=init_stroke, step=1, label="🖊️ 描边粗细 (如 30)")
+                    sub_btn = gr.Button("💬 一键应用字幕样式与位置", variant="primary")
+                    sub_result = gr.Textbox(label="字幕处理日志", lines=4)
+                    sub_btn.click(
+                        core_subtitle_styling_logic,
+                        inputs=[draft_path_input, project_dropdown, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider],
+                        outputs=[sub_result]
+                    )
+
+                # 功能 4：视频素材声音管理
+                with gr.Column(variant="panel"):
+                    gr.Markdown("#### 4. 🔊 视频素材声音管理")
                     gr.Markdown("一键解决导入视频自带杂音干扰的问题。")
                     audio_action = gr.Radio(
                         choices=[
@@ -1254,24 +1391,23 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                         outputs=[v_audio_result]
                     )
 
-                # 功能 4：音频名生成标题卡片
-                with gr.Column(variant="panel"):
-                    gr.Markdown("#### 4. 🎵 音频名生成标题卡片")
-                    gr.Markdown("提取音频文件名，在新文本轨道生成居中对齐卡片。")
-                    with gr.Row():
-                        split_char = gr.Textbox(value=".", label="起始截取符", scale=1)
-                        title_dur = gr.Number(value=3.0, label="时长(秒)", scale=1)
-                    with gr.Row():
-                        f_size1 = gr.Number(value=12, label="首行字号", scale=1)
-                        f_size2 = gr.Number(value=9, label="次行字号", scale=1)
-                        l_space = gr.Number(value=-0.23, label="行间距", scale=1)
-                    title_btn = gr.Button("🚀 提取并生成标题轨", variant="primary")
-                    title_result = gr.Textbox(label="生成日志", lines=4)
-                    title_btn.click(
-                        core_generate_audio_title_track,
-                        inputs=[draft_path_input, project_dropdown, split_char, f_size1, f_size2, l_space, title_dur],
-                        outputs=[title_result]
-                    )
+            # 功能 5：音频名生成标题卡片
+            with gr.Column(variant="panel"):
+                gr.Markdown("#### 5. 🎵 音频名生成标题卡片")
+                gr.Markdown("提取音频文件名，在新文本轨道生成居中对齐卡片。")
+                with gr.Row():
+                    split_char = gr.Textbox(value=".", label="起始截取符", scale=1)
+                    title_dur = gr.Number(value=3.0, label="时长(秒)", scale=1)
+                    f_size1 = gr.Number(value=12, label="首行字号", scale=1)
+                    f_size2 = gr.Number(value=9, label="次行字号", scale=1)
+                    l_space = gr.Number(value=-0.23, label="行间距", scale=1)
+                title_btn = gr.Button("🚀 提取并生成标题轨", variant="primary")
+                title_result = gr.Textbox(label="生成日志", lines=3)
+                title_btn.click(
+                    core_generate_audio_title_track,
+                    inputs=[draft_path_input, project_dropdown, split_char, f_size1, f_size2, l_space, title_dur],
+                    outputs=[title_result]
+                )
 
             def refresh_project_list(path):
                 projs = scan_jianying_projects(path)
@@ -1279,18 +1415,18 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                 last_p = str(cur_cfg.get("last_selected_project", ""))
                 chosen = last_p if last_p in projs else (projs[0] if projs else None)
                 save_config({"base_drafts_dir": path, "last_selected_project": chosen or ""})
-                rec_y, rec_size = inspect_draft_aspect_ratio(path, chosen)
-                return gr.update(choices=projs, value=chosen), rec_y, rec_size
+                rec_y, rec_size, rec_scale, rec_stroke = inspect_draft_aspect_ratio(path, chosen)
+                return gr.update(choices=projs, value=chosen), rec_y, rec_size, rec_scale, rec_stroke
 
             def on_proj_change(path, proj):
                 if proj is not None:
                     save_config({"base_drafts_dir": path, "last_selected_project": str(proj)})
-                rec_y, rec_size = inspect_draft_aspect_ratio(path, proj)
-                return rec_y, rec_size
+                rec_y, rec_size, rec_scale, rec_stroke = inspect_draft_aspect_ratio(path, proj)
+                return rec_y, rec_size, rec_scale, rec_stroke
 
-            draft_path_input.change(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown, sub_y_slider, sub_size_slider])
-            refresh_btn.click(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown, sub_y_slider, sub_size_slider])
-            project_dropdown.change(on_proj_change, inputs=[draft_path_input, project_dropdown], outputs=[sub_y_slider, sub_size_slider])
+            draft_path_input.change(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider])
+            refresh_btn.click(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider])
+            project_dropdown.change(on_proj_change, inputs=[draft_path_input, project_dropdown], outputs=[sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider])
 
 # ==========================================
 # 5. 启动入口
