@@ -9,6 +9,18 @@ chmod +x *.command
 
 # 执行完成之后，就可以直接双击 *.command 文件运行
 # 如果提示"无法打开，因为来自未识别的开发者"：右键文件 → 打开，仅需要操作一次解除安全限制
+# 如果报换行符错误：zsh: /Users/gnrsbass/Desktop/AutoVideoStudio/start-avs_mac.command: bad interpreter: /bin/bash^M: no such file or directory    请执行：
+sed -i '' 's/\r$//' /Users/gnrsbass/Desktop/AutoVideoStudio/start-avs_mac.command
+# 如果提示 sed 报错，可以换用 dos2unix（需要先安装）
+# 安装dos2unix（需要brew）
+brew install dos2unix
+dos2unix /Users/gnrsbass/Desktop/AutoVideoStudio/start-avs_mac.command
+
+
+Saving session...
+...copying shared history...
+...saving history...truncating history files...
+...completed.
 
 # Windows提示：
 # Windows直接双击 *.bat，不需要chmod授权
