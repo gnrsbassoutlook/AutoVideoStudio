@@ -10,6 +10,7 @@ import io
 import re
 import json
 import uuid
+import math
 import random
 import shutil
 import string
@@ -93,7 +94,6 @@ def normalize_path(path_str: str) -> str:
     if not path_str:
         return ""
     p = str(path_str).strip()
-    # 剥离中英文单双引号
     p = p.strip('"\'“”‘’')
     p = p.replace(r"\ ", " ")
     if p:
@@ -101,12 +101,7 @@ def normalize_path(path_str: str) -> str:
     return p
 
 def resolve_input_path(path_str, file_obj):
-    """
-    同时兼容：
-    1. 文本输入框中填入的绝对路径（支持Win右键带双引号地址、反斜杠/正斜杠兼容）
-    2. 上传控件上传的文件对象
-    返回: (有效路径, 是否为用户指定的真实源路径)
-    """
+    """同时兼容手动/带引号绝对路径与上传文件"""
     if path_str and path_str.strip():
         p = normalize_path(path_str)
         if os.path.exists(p):
@@ -116,11 +111,6 @@ def resolve_input_path(path_str, file_obj):
     return None, False
 
 def determine_out_path(source_file_path: str, suffix: str, ext: str, save_in_origin: bool, is_real_source: bool) -> str:
-    """
-    根据是否在原目录生成与来源类型决定保存路径：
-    - 如果是真实路径且勾选了在原目录生成，保存在原文件的同级目录下
-    - 如果是通过上传框拖入（临时文件），则统一生成在工程内的 AutoVideoStudio/outputs/ 目录中
-    """
     p = Path(source_file_path).resolve()
     target_ext = ext if ext else p.suffix
     if not target_ext.startswith('.'):
@@ -131,6 +121,88 @@ def determine_out_path(source_file_path: str, suffix: str, ext: str, save_in_ori
         out_path = p.parent / filename
     else:
         out_path = Path(OUTPUTS_DIR) / filename
+    return str(out_path)
+
+# ==========================================
+# 0.1 FFmpeg 跨平台执行引擎 (PingPong 专用)
+# ==========================================
+def get_ffmpeg_executable():
+    """获取系统中可用的 ffmpeg 命令路径"""
+    if shutil.which("ffmpeg"):
+        return "ffmpeg"
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        pass
+    return None
+
+def get_ffprobe_duration_us(video_path):
+    """获取视频物理文件的真实微秒时长"""
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", video_path
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True)
+        dur_sec = float(res.stdout.strip())
+        return int(dur_sec * 1000000)
+    except Exception:
+        return None
+
+def build_pingpong_video(src_video_path: str, num_repeats: int) -> str:
+    """
+    通过 FFmpeg 渲染正放+倒放相间的无缝 PingPong 实体视频（静音纯净画面）
+    num_repeats: 拼接总片数（>=2），例如 2 片: 正+反；3 片: 正+反+正
+    返回生成后的本地视频绝对路径
+    """
+    src_p = Path(src_video_path).resolve()
+    ffmpeg_bin = get_ffmpeg_executable()
+    if not ffmpeg_bin:
+        raise RuntimeError("系统未检测到 ffmpeg，请确保已安装 ffmpeg 并配置环境变量！")
+
+    out_name = f"{src_p.stem}_pingpong_{num_repeats}x{src_p.suffix}"
+    out_dir = src_p.parent
+    # 若源目录不可写，退回 outputs 目录
+    if not os.access(out_dir, os.W_OK):
+        out_dir = Path(OUTPUTS_DIR)
+    out_path = out_dir / out_name
+
+    # 若之前已生成过且文件存在，直接复用
+    if out_path.exists() and out_path.stat().st_size > 1000:
+        return str(out_path)
+
+    # 构造复杂滤镜图：偶数位正放，奇数位反放
+    # 如 num_repeats=3: [0:v]split=3[v0][v1][v2]; [v1]reverse[r1]; [v0][r1][v2]concat=n=3:v=1[outv]
+    splits = "".join([f"[v{i}]" for i in range(num_repeats)])
+    filter_parts = [f"[0:v]split={num_repeats}{splits}"]
+    
+    concat_inputs = []
+    for i in range(num_repeats):
+        if i % 2 == 1:
+            filter_parts.append(f"[v{i}]reverse[r{i}]")
+            concat_inputs.append(f"[r{i}]")
+        else:
+            concat_inputs.append(f"[v{i}]")
+            
+    concat_str = "".join(concat_inputs)
+    filter_parts.append(f"{concat_str}concat=n={num_repeats}:v=1[outv]")
+    filter_complex = ";".join(filter_parts)
+
+    cmd = [
+        ffmpeg_bin, "-y",
+        "-i", str(src_p),
+        "-filter_complex", filter_complex,
+        "-map", "[outv]",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "18",
+        "-an",
+        str(out_path)
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        raise RuntimeError(f"FFmpeg 生成 PingPong 视频失败: {res.stderr}")
     return str(out_path)
 
 # ==========================================
@@ -377,7 +449,6 @@ for cat, exts in MEDIA_CATEGORY_EXTENSIONS.items():
         EXT_TO_CATEGORY[ext] = cat
 
 def clean_media_base_name(stem: str) -> str:
-    """循环剥离末尾的副本/序号特征：如 _0001, _1, -1, (1), _(1), 空格2, 副本 等"""
     pattern = r'(_\d+|-\d+|\s+\d+|_\(\d+\)|\(\d+\)|\[\d+\]|[-_\s]*副本|\(副本\))$'
     cur = stem
     while True:
@@ -388,11 +459,6 @@ def clean_media_base_name(stem: str) -> str:
     return cur if cur else stem
 
 def extract_group_key(stem: str) -> str:
-    """
-    提取文件分组主键：
-    1. 优先提取前缀分镜序号（如 '01.演讲', '01_报告', '01-鼓掌' 均属于 '01' 组）
-    2. 若无序号前缀，则使用去除副本后缀后的主名（如 '报告'）
-    """
     clean_stem = clean_media_base_name(stem)
     match = re.match(r'^(\d+)[._\-\s]', clean_stem)
     if match:
@@ -400,7 +466,6 @@ def extract_group_key(stem: str) -> str:
     return f"name_{clean_stem.lower()}"
 
 def get_unique_target_path(target_folder: Path, filename: str) -> Path:
-    """若目标归档文件夹已存在同名文件，自动追加序号避免覆盖"""
     dest = target_folder / filename
     if not dest.exists():
         return dest
@@ -414,11 +479,6 @@ def get_unique_target_path(target_folder: Path, filename: str) -> Path:
         counter += 1
 
 def core_clean_media_folder(folder_path_str, mode_choice, retain_filter="all"):
-    """
-    清理媒体文件夹：
-    - 仅对存在多个类似/冲突文件的组合执行筛选去重
-    - 没有竞争的“独一份”文件（如 02.鼓掌.mp3, 03.散会.txt）绝对安全保留在原位！
-    """
     if not folder_path_str or not folder_path_str.strip():
         return "请先输入或粘贴需要整理的文件夹路径！", ""
     
@@ -428,7 +488,6 @@ def core_clean_media_folder(folder_path_str, mode_choice, retain_filter="all"):
         return f"❌ 错误: 路径不存在或不是文件夹: {clean_p}", ""
 
     parent_dir = directory.parent
-
     file_list = []
     try:
         for item in directory.iterdir():
@@ -576,7 +635,14 @@ def inspect_draft_aspect_ratio(draft_dir, project_name):
             pass
     return -600, 8.0, 115, 30
 
-def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08", min_speed_limit=0.6, snap_audio_boundary=True):
+def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingpong", snap_audio_boundary=True):
+    """
+    图文/视频轨道自动对齐:
+    - 模式D: 0.8x降速 + PingPong往复闭环 (严格保持轨道分镜片段总数 1 对 1 不分裂)
+    - 模式C: 1.0x原速 + PingPong往复闭环 (根据缝隙自动向上取整扩展)
+    - 模式A: 强制降速填满
+    - 模式B: 强制原速循环复制
+    """
     clean_dir = normalize_path(draft_dir)
     if not clean_dir or not project_name:
         return "请选择剪映草稿目录和工程名称！"
@@ -640,6 +706,7 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08", min
 
     curr_start = 0
     mod_count = 0
+    pingpong_rendered_count = 0
     new_video_segments = []
 
     def set_speed_material(seg, speed_val):
@@ -663,7 +730,9 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08", min
         video_mat = mat_videos_dict.get(mat_id, {})
         mat_type = video_mat.get("type", "photo")
         raw_vid_dur = int(video_mat.get("duration", 3000000))
+        video_path = video_mat.get("path", "")
 
+        # 计算目标字幕分镜缝隙时长 dur
         if i < num_pairs - 1:
             next_t_start = int(t_segs[i+1].get("target_timerange", {}).get("start", curr_start))
             target_end = max(curr_start + 1, next_t_start)
@@ -680,6 +749,7 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08", min
         dur = max(1, target_end - curr_start)
 
         if mat_type == "photo":
+            # 图片片段：直接拉长时间
             v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
             v["source_timerange"] = {"start": 0, "duration": int(dur)}
             if "common_keyframes" in v and isinstance(v["common_keyframes"], list):
@@ -691,29 +761,54 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08", min
             curr_start += dur
             mod_count += 1
         else:
-            if video_mode == "stretch_08":
+            # 视频片段处理
+            # ----------------------------------------------------
+            # 模式 D: 固定 0.8x 降速 + 自动调起 FFmpeg PingPong (严格1对1不分裂)
+            # ----------------------------------------------------
+            if video_mode == "stretch_08_pingpong":
                 fixed_speed = 0.8
                 source_needed = int(dur * fixed_speed)
-                actual_source = min(raw_vid_dur, source_needed)
-                actual_dur = dur if raw_vid_dur >= source_needed else int(raw_vid_dur / fixed_speed)
                 
-                v["target_timerange"] = {"start": int(curr_start), "duration": int(actual_dur)}
-                v["source_timerange"] = {"start": 0, "duration": int(actual_source)}
-                set_speed_material(v, fixed_speed)
-                new_video_segments.append(v)
-                curr_start += actual_dur
-                
-                rem_dur = dur - actual_dur
-                if rem_dur > 0:
-                    clone_seg = json.loads(json.dumps(v))
-                    clone_seg["id"] = str(uuid.uuid4()).upper()
-                    clone_seg["target_timerange"] = {"start": int(curr_start), "duration": int(rem_dur)}
-                    clone_seg["source_timerange"] = {"start": 0, "duration": int(min(raw_vid_dur, int(rem_dur * fixed_speed)))}
-                    set_speed_material(clone_seg, fixed_speed)
-                    new_video_segments.append(clone_seg)
-                    curr_start += rem_dur
-                mod_count += 1
-            else:
+                if raw_vid_dur >= source_needed:
+                    # 原素材在 0.8x 下时长足够覆盖，无需 PingPong
+                    v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
+                    v["source_timerange"] = {"start": 0, "duration": int(source_needed)}
+                    set_speed_material(v, fixed_speed)
+                    new_video_segments.append(v)
+                    curr_start += dur
+                    mod_count += 1
+                else:
+                    # 原素材不足以覆盖，启动 FFmpeg PingPong 往复延长！
+                    repeats = math.ceil(source_needed / raw_vid_dur)
+                    if repeats < 2:
+                        repeats = 2
+                    
+                    if video_path and os.path.exists(video_path):
+                        try:
+                            pingpong_file = build_pingpong_video(video_path, repeats)
+                            new_dur = raw_vid_dur * repeats
+                            # 更新草稿中的素材引用
+                            video_mat["path"] = pingpong_file
+                            video_mat["duration"] = int(new_dur)
+                            video_mat["material_name"] = os.path.basename(pingpong_file)
+                            raw_vid_dur = new_dur
+                            pingpong_rendered_count += 1
+                        except Exception as e:
+                            print(f"FFmpeg PingPong 处理异常: {e}")
+
+                    actual_source = min(raw_vid_dur, source_needed)
+                    actual_dur = int(actual_source / fixed_speed)
+                    v["target_timerange"] = {"start": int(curr_start), "duration": int(actual_dur)}
+                    v["source_timerange"] = {"start": 0, "duration": int(actual_source)}
+                    set_speed_material(v, fixed_speed)
+                    new_video_segments.append(v)
+                    curr_start += actual_dur
+                    mod_count += 1
+
+            # ----------------------------------------------------
+            # 模式 C: 原速 1.0x + 自动调起 FFmpeg PingPong (严格1对1不分裂)
+            # ----------------------------------------------------
+            elif video_mode == "pingpong_1x":
                 if raw_vid_dur >= dur:
                     v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
                     v["source_timerange"] = {"start": 0, "duration": int(dur)}
@@ -722,52 +817,71 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08", min
                     curr_start += dur
                     mod_count += 1
                 else:
+                    repeats = math.ceil(dur / raw_vid_dur)
+                    if repeats < 2:
+                        repeats = 2
+                    
+                    if video_path and os.path.exists(video_path):
+                        try:
+                            pingpong_file = build_pingpong_video(video_path, repeats)
+                            new_dur = raw_vid_dur * repeats
+                            video_mat["path"] = pingpong_file
+                            video_mat["duration"] = int(new_dur)
+                            video_mat["material_name"] = os.path.basename(pingpong_file)
+                            raw_vid_dur = new_dur
+                            pingpong_rendered_count += 1
+                        except Exception as e:
+                            print(f"FFmpeg PingPong 处理异常: {e}")
+
+                    actual_dur = min(raw_vid_dur, dur)
+                    v["target_timerange"] = {"start": int(curr_start), "duration": int(actual_dur)}
+                    v["source_timerange"] = {"start": 0, "duration": int(actual_dur)}
+                    set_speed_material(v, 1.0)
+                    new_video_segments.append(v)
+                    curr_start += actual_dur
+                    mod_count += 1
+
+            # ----------------------------------------------------
+            # 模式 A: 强制降速填满
+            # ----------------------------------------------------
+            elif video_mode == "slow_down":
+                if raw_vid_dur >= dur:
+                    v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
+                    v["source_timerange"] = {"start": 0, "duration": int(dur)}
+                    set_speed_material(v, 1.0)
+                else:
                     calc_speed = raw_vid_dur / dur
-                    if video_mode == "slow_down":
-                        v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
-                        v["source_timerange"] = {"start": 0, "duration": int(raw_vid_dur)}
-                        set_speed_material(v, calc_speed)
-                        new_video_segments.append(v)
-                        curr_start += dur
+                    v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
+                    v["source_timerange"] = {"start": 0, "duration": int(raw_vid_dur)}
+                    set_speed_material(v, calc_speed)
+                new_video_segments.append(v)
+                curr_start += dur
+                mod_count += 1
+
+            # ----------------------------------------------------
+            # 模式 B: 强制原速循环复制
+            # ----------------------------------------------------
+            elif video_mode == "loop_copy":
+                if raw_vid_dur >= dur:
+                    v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
+                    v["source_timerange"] = {"start": 0, "duration": int(dur)}
+                    set_speed_material(v, 1.0)
+                    new_video_segments.append(v)
+                    curr_start += dur
+                    mod_count += 1
+                else:
+                    rem_dur = dur
+                    while rem_dur > 0:
+                        take_dur = min(rem_dur, raw_vid_dur)
+                        clone_seg = json.loads(json.dumps(v))
+                        clone_seg["id"] = str(uuid.uuid4()).upper()
+                        clone_seg["target_timerange"] = {"start": int(curr_start), "duration": int(take_dur)}
+                        clone_seg["source_timerange"] = {"start": 0, "duration": int(take_dur)}
+                        set_speed_material(clone_seg, 1.0)
+                        new_video_segments.append(clone_seg)
+                        curr_start += take_dur
+                        rem_dur -= take_dur
                         mod_count += 1
-                    elif video_mode == "loop_copy":
-                        rem_dur = dur
-                        while rem_dur > 0:
-                            take_dur = min(rem_dur, raw_vid_dur)
-                            clone_seg = json.loads(json.dumps(v))
-                            clone_seg["id"] = str(uuid.uuid4()).upper()
-                            clone_seg["target_timerange"] = {"start": int(curr_start), "duration": int(take_dur)}
-                            clone_seg["source_timerange"] = {"start": 0, "duration": int(take_dur)}
-                            set_speed_material(clone_seg, 1.0)
-                            new_video_segments.append(clone_seg)
-                            curr_start += take_dur
-                            rem_dur -= take_dur
-                            mod_count += 1
-                    elif video_mode == "smart":
-                        threshold = float(min_speed_limit)
-                        if calc_speed >= threshold:
-                            v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
-                            v["source_timerange"] = {"start": 0, "duration": int(raw_vid_dur)}
-                            set_speed_material(v, calc_speed)
-                            new_video_segments.append(v)
-                            curr_start += dur
-                            mod_count += 1
-                        else:
-                            slow_speed = threshold
-                            max_expanded_dur = int(raw_vid_dur / slow_speed)
-                            rem_dur = dur
-                            while rem_dur > 0:
-                                cur_target_dur = min(rem_dur, max_expanded_dur)
-                                cur_source_dur = int(cur_target_dur * slow_speed)
-                                clone_seg = json.loads(json.dumps(v))
-                                clone_seg["id"] = str(uuid.uuid4()).upper()
-                                clone_seg["target_timerange"] = {"start": int(curr_start), "duration": int(cur_target_dur)}
-                                clone_seg["source_timerange"] = {"start": 0, "duration": int(cur_source_dur)}
-                                set_speed_material(clone_seg, slow_speed)
-                                new_video_segments.append(clone_seg)
-                                curr_start += cur_target_dur
-                                rem_dur -= cur_target_dur
-                                mod_count += 1
 
     if len(v_segs) > num_pairs:
         for i in range(num_pairs, len(v_segs)):
@@ -785,7 +899,8 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08", min
         json.dump(data, f, ensure_ascii=False, indent=2)
 
     snap_msg = "（已启用音频断点截断）" if snap_audio_boundary else ""
-    return f"🎉 对齐成功！{snap_msg}{track_log_info}\n- 处理片段数: {mod_count}\n- 末尾已自动吸附全工程终点: {curr_start/1000000:.2f}秒\n- 自动备份: {os.path.basename(backup_path)}"
+    pingpong_msg = f"\n🏓 PingPong 处理: 已通过 FFmpeg 无损扩展 {pingpong_rendered_count} 个过短素材，主轨素材片段总数严格保持 1 对 1（共 {len(new_video_segments)} 段）！" if pingpong_rendered_count > 0 else ""
+    return f"🎉 对齐成功！{snap_msg}{track_log_info}{pingpong_msg}\n- 对齐片段数: {mod_count}\n- 吸附全工程终点: {curr_start/1000000:.2f}秒\n- 自动备份: {os.path.basename(backup_path)}"
 
 def core_add_keyframes_only_logic(draft_dir, project_name, zoom_min, zoom_max, pan_mag, auto_blur_bg=True):
     clean_dir = normalize_path(draft_dir)
@@ -889,13 +1004,11 @@ def core_subtitle_styling_logic(draft_dir, project_name, sub_pixel_y=-600, font_
     canvas_cfg = data.get("canvas_config", {})
     height = float(canvas_cfg.get("height", 1920))
     
-    # 剪映界面显示的像素值 = norm_y * height，因此 norm_y = pixel_y / height
     norm_y = float(sub_pixel_y) / height
     target_scale = float(scale_pct) / 100.0
     stroke_width_val = float(stroke_val) * 0.002
     target_font_size = float(font_size)
 
-    # 1. 遍历 materials.texts 中的字号、预设白字黑边与段落居中属性
     mod_text_count = 0
     for txt in data.get("materials", {}).get("texts", []):
         txt["font_size"] = target_font_size
@@ -928,7 +1041,6 @@ def core_subtitle_styling_logic(draft_dir, project_name, sub_pixel_y=-600, font_
                 pass
         mod_text_count += 1
 
-    # 2. 统一 text 轨道上所有字幕片段的 (X=0.0居中, Y=norm_y, 缩放scale)
     seg_count = 0
     for t in tracks:
         if t.get("type") == "text":
@@ -1327,25 +1439,23 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                 # 功能 1：图文/视频自动吸附
                 with gr.Column(variant="panel"):
                     gr.Markdown("#### 1. 🖼️ 图文/视频自动吸附字幕")
-                    gr.Markdown("💡 **智能双字幕识别**：自动选用分镜位置参考字幕轨，忽略细碎台词轨。")
+                    gr.Markdown("💡 **严格 1:1 分镜**：无论延展多少倍，主轨道素材片段数量严格不变！")
                     video_mode = gr.Radio(
                         choices=[
-                            ("模式D: 强行降速拉长 (固定0.8x，杜绝首尾跳帧且无重复拷贝) [默认推荐]", "stretch_08"),
-                            ("模式C: 智能降速+复制组合", "smart"),
-                            ("模式A: 强制降速填满", "slow_down"),
-                            ("模式B: 强制原速循环复制", "loop_copy")
+                            ("模式D: 0.8x降速 + PingPong往复闭环 [默认推荐，严格保持素材数1对1]", "stretch_08_pingpong"),
+                            ("模式C: 1.0x原速 + PingPong往复闭环 [严格保持素材数1对1]", "pingpong_1x"),
+                            ("模式A: 强制纯降速填满", "slow_down"),
+                            ("模式B: 强制原速循环复制 (会产生多段分裂片段)", "loop_copy")
                         ],
-                        value="stretch_08",
+                        value="stretch_08_pingpong",
                         label="视频填充策略"
                     )
-                    with gr.Row():
-                        min_speed = gr.Slider(minimum=0.2, maximum=0.9, value=0.6, step=0.05, label="模式C降速下限阈值 (如 0.6x)")
-                        snap_audio_chk = gr.Checkbox(value=True, label="🎵 音频断点自动截断（杜绝跨句越界）")
+                    snap_audio_chk = gr.Checkbox(value=True, label="🎵 音频断点自动截断（杜绝跨句越界）")
                     align_btn = gr.Button("⚡ 执行素材对齐字幕", variant="primary")
-                    align_result = gr.Textbox(label="执行日志", lines=5)
+                    align_result = gr.Textbox(label="执行日志", lines=6)
                     align_btn.click(
                         core_align_media_logic, 
-                        inputs=[draft_path_input, project_dropdown, video_mode, min_speed, snap_audio_chk], 
+                        inputs=[draft_path_input, project_dropdown, video_mode, snap_audio_chk], 
                         outputs=[align_result]
                     )
 
