@@ -576,7 +576,7 @@ def inspect_draft_aspect_ratio(draft_dir, project_name):
             pass
     return -600, 8.0, 115, 30
 
-def core_align_media_logic(draft_dir, project_name, video_mode="stretch_085", min_speed_limit=0.6, snap_audio_boundary=True):
+def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08", min_speed_limit=0.6, snap_audio_boundary=True):
     clean_dir = normalize_path(draft_dir)
     if not clean_dir or not project_name:
         return "请选择剪映草稿目录和工程名称！"
@@ -691,8 +691,8 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_085", mi
             curr_start += dur
             mod_count += 1
         else:
-            if video_mode == "stretch_085":
-                fixed_speed = 0.85
+            if video_mode == "stretch_08":
+                fixed_speed = 0.8
                 source_needed = int(dur * fixed_speed)
                 actual_source = min(raw_vid_dur, source_needed)
                 actual_dur = dur if raw_vid_dur >= source_needed else int(raw_vid_dur / fixed_speed)
@@ -1330,12 +1330,12 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                     gr.Markdown("💡 **智能双字幕识别**：自动选用分镜位置参考字幕轨，忽略细碎台词轨。")
                     video_mode = gr.Radio(
                         choices=[
-                            ("模式D: 强行降速拉长 (固定0.85x，杜绝首尾跳帧且无重复拷贝) [默认推荐]", "stretch_085"),
+                            ("模式D: 强行降速拉长 (固定0.8x，杜绝首尾跳帧且无重复拷贝) [默认推荐]", "stretch_08"),
                             ("模式C: 智能降速+复制组合", "smart"),
                             ("模式A: 强制降速填满", "slow_down"),
                             ("模式B: 强制原速循环复制", "loop_copy")
                         ],
-                        value="stretch_085",
+                        value="stretch_08",
                         label="视频填充策略"
                     )
                     with gr.Row():
