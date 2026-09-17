@@ -635,80 +635,79 @@ def inspect_draft_aspect_ratio(draft_dir, project_name):
             pass
     return -600, 8.0, 115, 30
 
+def resolve_jianying_material_path(raw_path: str, project_dir: str):
+    """
+    自适应兼容两种素材模式：
+    1. 复制至草稿（带 ##_draftpath_placeholder_xxx_## 占位符）
+    2. 保留在原有位置（外部真实绝对路径）
+    返回: (真实可读写的物理路径, 原始占位符前缀/None)
+    """
+    if not raw_path:
+        return "", None
+    
+    placeholder_match = re.search(r'(##_draftpath_placeholder_[^#]+_##)', raw_path)
+    placeholder_token = placeholder_match.group(1) if placeholder_match else None
+
+    if placeholder_token:
+        # 模式一：复制至草稿 -> 还原为工程内的真实路径
+        real_path = raw_path.replace(placeholder_token, project_dir)
+        return normalize_path(real_path), placeholder_token
+    else:
+        # 模式二：保留在原有位置 -> 直接使用原生路径
+        return normalize_path(raw_path), None
+
 def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingpong", snap_audio_boundary=True):
     """
-    图文/视频轨道自动对齐:
-    - 模式D: 0.8x降速 + PingPong往复闭环 (严格保持轨道分镜片段总数 1 对 1 不分裂)
-    - 模式C: 1.0x原速 + PingPong往复闭环 (根据缝隙自动向上取整扩展)
-    - 模式A: 强制降速填满
-    - 模式B: 强制原速循环复制
+    图文/视频轨道自动对齐
+    1. 首分镜顶头(0)
+    2. 每个分镜的终点绝对以【下一句字幕起点】或【音频真实断点】为收刀线，绝不擅自捅到全片尾巴！
+    3. 智能锁定分片最多的真正字幕轨道
     """
     clean_dir = normalize_path(draft_dir)
     if not clean_dir or not project_name:
-        return "请选择剪映草稿目录和工程名称！"
+        yield "❌ 请选择剪映草稿目录和工程名称！"
+        return
     
     project_dir = os.path.join(clean_dir, str(project_name))
     draft_json_path = get_draft_json_file(project_dir)
     if not os.path.exists(draft_json_path):
-        return f"未在选定工程中找到草稿文件: {project_dir}"
-
+        yield f"❌ 未在选定工程中找到草稿文件: {project_dir}"
+        return
+    local_res_dir = os.path.join(project_dir, "Resources", "local")
+    os.makedirs(local_res_dir, exist_ok=True)
     backup_path = backup_draft_json(draft_json_path, "align_bak")
     with open(draft_json_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
-
     tracks = data.get("tracks", [])
     video_track = next((t for t in tracks if t.get("type") == "video"), None)
-    
     text_tracks = [t for t in tracks if t.get("type") == "text" and len(t.get("segments", [])) > 0]
     if not video_track or not text_tracks:
-        return "错误：草稿中必须包含至少一条【主视频/图片轨道】和一条【有效字幕轨道】！"
-
-    track_log_info = ""
-    if len(text_tracks) == 1:
-        text_track = text_tracks[0]
-    else:
-        text_tracks.sort(key=lambda t: len(t.get("segments", [])))
-        text_track = text_tracks[0]
-        other_counts = [len(t.get("segments", [])) for t in text_tracks[1:]]
-        track_log_info = f"\n🎯 智能识别多条字幕轨: 已自动选用【分镜参考字幕轨】(共 {len(text_track.get('segments', []))} 段)，忽略高频台词轨({other_counts}段)"
-
-    audio_segments_bounds = []
-    max_project_end = 0
+        yield "❌ 错误：草稿中必须包含至少一条【主视频/图片轨道】和一条【有效字幕轨道】！"
+        return
+    # 1. 扫描所有音频物理片段
+    raw_audio_clips = []
     for t in tracks:
-        is_audio = (t.get("type") == "audio")
-        for seg in t.get("segments", []):
-            tg = seg.get("target_timerange", {})
-            st = int(tg.get("start", 0))
-            dt = int(tg.get("duration", 0))
-            ed = st + dt
-            if ed > max_project_end:
-                max_project_end = ed
-            if is_audio and dt > 0:
-                audio_segments_bounds.append((st, ed))
-
-    audio_segments_bounds.sort(key=lambda x: x[0])
-
-    def find_audio_bound_for_time(t):
-        for st, ed in audio_segments_bounds:
-            if st <= t < ed:
-                return st, ed
-        return None, None
-
-    mat_videos_dict = {v["id"]: v for v in data.get("materials", {}).get("videos", [])}
-    mat_speeds_dict = {s["id"]: s for s in data.get("materials", {}).get("speeds", [])}
-
+        if t.get("type") == "audio":
+            for seg in t.get("segments", []):
+                tg = seg.get("target_timerange", {})
+                st = int(tg.get("start", 0))
+                dt = int(tg.get("duration", 0))
+                if dt > 0:
+                    raw_audio_clips.append({"start": st, "end": st + dt})
+    raw_audio_clips.sort(key=lambda x: x["start"])
+    # 2. 纯粹直连：锁定唯一的主字幕轨作为标尺
+    if len(text_tracks) > 1:
+        text_track = max(text_tracks, key=lambda t: len(t.get("segments", [])))
+    else:
+        text_track = text_tracks[0]
     v_segs = sorted(video_track.get("segments", []), key=lambda s: int(s.get("target_timerange", {}).get("start", 0)))
     t_segs = sorted(text_track.get("segments", []), key=lambda s: int(s.get("target_timerange", {}).get("start", 0)))
-
     num_pairs = min(len(v_segs), len(t_segs))
     if num_pairs == 0:
-        return "未找到可对齐的片段！"
-
-    curr_start = 0
-    mod_count = 0
-    pingpong_rendered_count = 0
-    new_video_segments = []
-
+        yield "❌ 未找到可对齐的片段！"
+        return
+    mat_videos_dict = {v["id"]: v for v in data.get("materials", {}).get("videos", [])}
+    mat_speeds_dict = {s["id"]: s for s in data.get("materials", {}).get("speeds", [])}
     def set_speed_material(seg, speed_val):
         speed_mat = None
         for ref in seg.get("extra_material_refs", []):
@@ -723,166 +722,187 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
         else:
             speed_mat["speed"] = float(speed_val)
         seg["speed"] = float(speed_val)
-
+    # 3. 核心：计算每个分镜的严格物理区间
+    computed_spans = []
+    for i in range(num_pairs):
+        cur_t_st = int(t_segs[i].get("target_timerange", {}).get("start", 0))
+        cur_t_dt = int(t_segs[i].get("target_timerange", {}).get("duration", 1000000))
+        
+        # 终点首先看有没有下一句字幕（以全部字幕为准，绝不仅看视频数量！）
+        if i < len(t_segs) - 1:
+            next_t_st = int(t_segs[i+1].get("target_timerange", {}).get("start", cur_t_st + cur_t_dt))
+        else:
+            next_t_st = cur_t_st + cur_t_dt
+        # 起点计算：第0个死死顶头0；其余严格以字幕或新音频起始为界
+        if i == 0:
+            seg_start = 0
+        else:
+            seg_start = cur_t_st
+            if snap_audio_boundary and raw_audio_clips:
+                prev_base = int(t_segs[i-1].get("target_timerange", {}).get("start", 0))
+                for clip in raw_audio_clips:
+                    if prev_base < clip["start"] <= cur_t_st:
+                        seg_start = clip["start"]
+                        break
+        # 终点默认吸附到下一句字幕头
+        seg_end = next_t_st
+        # 音频截断判断：如果在 [seg_start, seg_end] 之间音频结束了，必须在该音频尾截断！
+        if snap_audio_boundary and raw_audio_clips:
+            possible_cuts = []
+            for clip in raw_audio_clips:
+                if seg_start < clip["end"] < seg_end:
+                    possible_cuts.append(clip["end"])
+                if seg_start < clip["start"] < seg_end:
+                    possible_cuts.append(clip["start"])
+            if possible_cuts:
+                seg_end = min(possible_cuts)
+        if seg_end <= seg_start:
+            seg_end = seg_start + max(500000, cur_t_dt)
+        computed_spans.append((int(seg_start), int(seg_end)))
+    mod_count = 0
+    pingpong_rendered_count = 0
+    new_video_segments = []
+    live_logs = [f"🚀 正在分析草稿分镜 (共 {num_pairs} 对)...已锁定严格字幕间隙标尺"]
+    yield "\n".join(live_logs)
+    # 4. 执行应用与 PingPong (按需渲染，绝不过度延伸)
     for i in range(num_pairs):
         v = v_segs[i]
         mat_id = v.get("material_id")
         video_mat = mat_videos_dict.get(mat_id, {})
         mat_type = video_mat.get("type", "photo")
-        raw_vid_dur = int(video_mat.get("duration", 3000000))
-        video_path = video_mat.get("path", "")
-
-        # 计算目标字幕分镜缝隙时长 dur
-        if i < num_pairs - 1:
-            next_t_start = int(t_segs[i+1].get("target_timerange", {}).get("start", curr_start))
-            target_end = max(curr_start + 1, next_t_start)
-        else:
-            last_text_end = int(t_segs[i].get("target_timerange", {}).get("start", 0)) + int(t_segs[i].get("target_timerange", {}).get("duration", 1000000))
-            final_target_end = max(max_project_end, last_text_end)
-            target_end = max(curr_start + 1, final_target_end)
-
-        if snap_audio_boundary and audio_segments_bounds:
-            a_st, a_ed = find_audio_bound_for_time(curr_start)
-            if a_ed is not None and target_end > a_ed:
-                target_end = a_ed
-
-        dur = max(1, target_end - curr_start)
-
+        video_path, placeholder_token = resolve_jianying_material_path(video_mat.get("path", ""), project_dir)
+        real_probe_dur = get_ffprobe_duration_us(video_path) if (video_path and os.path.exists(video_path)) else None
+        raw_vid_dur = int(real_probe_dur or video_mat.get("duration", 3000000))
+        seg_start, seg_end = computed_spans[i]
+        dur = max(1, seg_end - seg_start)
         if mat_type == "photo":
-            # 图片片段：直接拉长时间
-            v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
-            v["source_timerange"] = {"start": 0, "duration": int(dur)}
+            v["target_timerange"] = {"start": seg_start, "duration": dur}
+            v["source_timerange"] = {"start": 0, "duration": dur}
             if "common_keyframes" in v and isinstance(v["common_keyframes"], list):
                 for prop in v["common_keyframes"]:
                     kfs = prop.get("keyframe_list", [])
                     if kfs:
                         kfs[-1]["time_offset"] = int(dur)
             new_video_segments.append(v)
-            curr_start += dur
             mod_count += 1
         else:
-            # 视频片段处理
-            # ----------------------------------------------------
-            # 模式 D: 固定 0.8x 降速 + 自动调起 FFmpeg PingPong (严格1对1不分裂)
-            # ----------------------------------------------------
+            # 模式 D: 0.8x + PingPong
             if video_mode == "stretch_08_pingpong":
                 fixed_speed = 0.8
                 source_needed = int(dur * fixed_speed)
-                
                 if raw_vid_dur >= source_needed:
-                    # 原素材在 0.8x 下时长足够覆盖，无需 PingPong
-                    v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
-                    v["source_timerange"] = {"start": 0, "duration": int(source_needed)}
+                    v["target_timerange"] = {"start": seg_start, "duration": dur}
+                    v["source_timerange"] = {"start": 0, "duration": source_needed}
                     set_speed_material(v, fixed_speed)
                     new_video_segments.append(v)
-                    curr_start += dur
                     mod_count += 1
                 else:
-                    # 原素材不足以覆盖，启动 FFmpeg PingPong 往复延长！
-                    repeats = math.ceil(source_needed / raw_vid_dur)
-                    if repeats < 2:
-                        repeats = 2
-                    
-                    if video_path and os.path.exists(video_path):
+                    repeats = max(2, math.ceil(source_needed / raw_vid_dur))
+                    raw_s = raw_vid_dur / 1000000.0
+                    tgt_s = dur / 1000000.0
+                    live_logs.append(f"⚠️ [分镜 {i+1}] 0.8x不足({raw_s:.2f}s < 目标{tgt_s:.2f}s) -> PingPong({repeats}片往复)...")
+                    yield "\n".join(live_logs)
+                    if not os.path.exists(video_path):
+                        live_logs.append(f"❌ 警告: 找不到源视频文件: {video_path}")
+                        yield "\n".join(live_logs)
+                    else:
                         try:
                             pingpong_file = build_pingpong_video(video_path, repeats)
                             new_dur = raw_vid_dur * repeats
-                            # 更新草稿中的素材引用
-                            video_mat["path"] = pingpong_file
+                            if placeholder_token and project_dir in pingpong_file:
+                                video_mat["path"] = pingpong_file.replace(project_dir, placeholder_token)
+                            else:
+                                video_mat["path"] = pingpong_file
                             video_mat["duration"] = int(new_dur)
                             video_mat["material_name"] = os.path.basename(pingpong_file)
                             raw_vid_dur = new_dur
                             pingpong_rendered_count += 1
+                            live_logs.append(f"  ✅ [分镜 {i+1}] FFmpeg 渲染成功！新时长: {new_dur/1000000:.2f}s")
+                            yield "\n".join(live_logs)
                         except Exception as e:
-                            print(f"FFmpeg PingPong 处理异常: {e}")
-
-                    actual_source = min(raw_vid_dur, source_needed)
-                    actual_dur = int(actual_source / fixed_speed)
-                    v["target_timerange"] = {"start": int(curr_start), "duration": int(actual_dur)}
-                    v["source_timerange"] = {"start": 0, "duration": int(actual_source)}
+                            live_logs.append(f"  ❌ FFmpeg 渲染失败: {e}")
+                            yield "\n".join(live_logs)
+                    v["target_timerange"] = {"start": seg_start, "duration": dur}
+                    v["source_timerange"] = {"start": 0, "duration": source_needed}
                     set_speed_material(v, fixed_speed)
                     new_video_segments.append(v)
-                    curr_start += actual_dur
                     mod_count += 1
-
-            # ----------------------------------------------------
-            # 模式 C: 原速 1.0x + 自动调起 FFmpeg PingPong (严格1对1不分裂)
-            # ----------------------------------------------------
+            # 模式 C: 1.0x + PingPong
             elif video_mode == "pingpong_1x":
                 if raw_vid_dur >= dur:
-                    v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
-                    v["source_timerange"] = {"start": 0, "duration": int(dur)}
+                    v["target_timerange"] = {"start": seg_start, "duration": dur}
+                    v["source_timerange"] = {"start": 0, "duration": dur}
                     set_speed_material(v, 1.0)
                     new_video_segments.append(v)
-                    curr_start += dur
                     mod_count += 1
                 else:
-                    repeats = math.ceil(dur / raw_vid_dur)
-                    if repeats < 2:
-                        repeats = 2
-                    
-                    if video_path and os.path.exists(video_path):
+                    repeats = max(2, math.ceil(dur / raw_vid_dur))
+                    raw_s = raw_vid_dur / 1000000.0
+                    tgt_s = dur / 1000000.0
+                    live_logs.append(f"⚠️ [分镜 {i+1}] 视频不足({raw_s:.2f}s < 目标{tgt_s:.2f}s) -> PingPong({repeats}片往复)...")
+                    yield "\n".join(live_logs)
+                    if not os.path.exists(video_path):
+                        live_logs.append(f"❌ 警告: 找不到源视频文件: {video_path}")
+                        yield "\n".join(live_logs)
+                    else:
                         try:
                             pingpong_file = build_pingpong_video(video_path, repeats)
                             new_dur = raw_vid_dur * repeats
-                            video_mat["path"] = pingpong_file
+                            if placeholder_token and project_dir in pingpong_file:
+                                video_mat["path"] = pingpong_file.replace(project_dir, placeholder_token)
+                            else:
+                                video_mat["path"] = pingpong_file
                             video_mat["duration"] = int(new_dur)
                             video_mat["material_name"] = os.path.basename(pingpong_file)
                             raw_vid_dur = new_dur
                             pingpong_rendered_count += 1
+                            live_logs.append(f"  ✅ [分镜 {i+1}] FFmpeg 渲染成功！新时长: {new_dur/1000000:.2f}s")
+                            yield "\n".join(live_logs)
                         except Exception as e:
-                            print(f"FFmpeg PingPong 处理异常: {e}")
-
-                    actual_dur = min(raw_vid_dur, dur)
-                    v["target_timerange"] = {"start": int(curr_start), "duration": int(actual_dur)}
-                    v["source_timerange"] = {"start": 0, "duration": int(actual_dur)}
+                            live_logs.append(f"  ❌ FFmpeg 渲染失败: {e}")
+                            yield "\n".join(live_logs)
+                    v["target_timerange"] = {"start": seg_start, "duration": dur}
+                    v["source_timerange"] = {"start": 0, "duration": dur}
                     set_speed_material(v, 1.0)
                     new_video_segments.append(v)
-                    curr_start += actual_dur
                     mod_count += 1
-
-            # ----------------------------------------------------
-            # 模式 A: 强制降速填满
-            # ----------------------------------------------------
+            # 模式 A: 纯降速
             elif video_mode == "slow_down":
                 if raw_vid_dur >= dur:
-                    v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
-                    v["source_timerange"] = {"start": 0, "duration": int(dur)}
+                    v["target_timerange"] = {"start": seg_start, "duration": dur}
+                    v["source_timerange"] = {"start": 0, "duration": dur}
                     set_speed_material(v, 1.0)
                 else:
                     calc_speed = raw_vid_dur / dur
-                    v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
-                    v["source_timerange"] = {"start": 0, "duration": int(raw_vid_dur)}
+                    v["target_timerange"] = {"start": seg_start, "duration": dur}
+                    v["source_timerange"] = {"start": 0, "duration": raw_vid_dur}
                     set_speed_material(v, calc_speed)
                 new_video_segments.append(v)
-                curr_start += dur
                 mod_count += 1
-
-            # ----------------------------------------------------
-            # 模式 B: 强制原速循环复制
-            # ----------------------------------------------------
+            # 模式 B: 原速循环复制
             elif video_mode == "loop_copy":
                 if raw_vid_dur >= dur:
-                    v["target_timerange"] = {"start": int(curr_start), "duration": int(dur)}
-                    v["source_timerange"] = {"start": 0, "duration": int(dur)}
+                    v["target_timerange"] = {"start": seg_start, "duration": dur}
+                    v["source_timerange"] = {"start": 0, "duration": dur}
                     set_speed_material(v, 1.0)
                     new_video_segments.append(v)
-                    curr_start += dur
                     mod_count += 1
                 else:
                     rem_dur = dur
+                    sub_start = seg_start
                     while rem_dur > 0:
                         take_dur = min(rem_dur, raw_vid_dur)
                         clone_seg = json.loads(json.dumps(v))
                         clone_seg["id"] = str(uuid.uuid4()).upper()
-                        clone_seg["target_timerange"] = {"start": int(curr_start), "duration": int(take_dur)}
-                        clone_seg["source_timerange"] = {"start": 0, "duration": int(take_dur)}
+                        clone_seg["target_timerange"] = {"start": sub_start, "duration": take_dur}
+                        clone_seg["source_timerange"] = {"start": 0, "duration": take_dur}
                         set_speed_material(clone_seg, 1.0)
                         new_video_segments.append(clone_seg)
-                        curr_start += take_dur
+                        sub_start += take_dur
                         rem_dur -= take_dur
                         mod_count += 1
-
+    max_track_end = max([int(s["target_timerange"]["start"]) + int(s["target_timerange"]["duration"]) for s in new_video_segments], default=0)
+    curr_start = max_track_end
     if len(v_segs) > num_pairs:
         for i in range(num_pairs, len(v_segs)):
             v = v_segs[i]
@@ -891,16 +911,15 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
             curr_start += d
             new_video_segments.append(v)
             mod_count += 1
-
     video_track["segments"] = new_video_segments
-    data["duration"] = int(curr_start)
-
+    max_track_end = max([int(s["target_timerange"]["start"]) + int(s["target_timerange"]["duration"]) for s in new_video_segments], default=0)
+    data["duration"] = int(max(data.get("duration", 0), max_track_end))
     with open(draft_json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
-
-    snap_msg = "（已启用音频断点截断）" if snap_audio_boundary else ""
-    pingpong_msg = f"\n🏓 PingPong 处理: 已通过 FFmpeg 无损扩展 {pingpong_rendered_count} 个过短素材，主轨素材片段总数严格保持 1 对 1（共 {len(new_video_segments)} 段）！" if pingpong_rendered_count > 0 else ""
-    return f"🎉 对齐成功！{snap_msg}{track_log_info}{pingpong_msg}\n- 对齐片段数: {mod_count}\n- 吸附全工程终点: {curr_start/1000000:.2f}秒\n- 自动备份: {os.path.basename(backup_path)}"
+    snap_msg = "（已按音频物理断点严格截断对齐）" if snap_audio_boundary else ""
+    pingpong_msg = f"\n🏓 PingPong 统计: 共对 {pingpong_rendered_count} 个素材完成了往复渲染填满，主轨分镜数保持 1:1（共 {len(new_video_segments)} 个分镜）！"
+    live_logs.append(f"\n🎉 全部对齐成功！{snap_msg}{pingpong_msg}\n- 对齐片段数: {mod_count}\n- 视频轨道当前总长度: {max_track_end/1000000:.2f}秒\n- 自动备份: {os.path.basename(backup_path)}")
+    yield "\n".join(live_logs)
 
 def core_add_keyframes_only_logic(draft_dir, project_name, zoom_min, zoom_max, pan_mag, auto_blur_bg=True):
     clean_dir = normalize_path(draft_dir)
@@ -1442,23 +1461,23 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                     gr.Markdown("💡 **严格 1:1 分镜**：无论延展多少倍，主轨道素材片段数量严格不变！")
                     video_mode = gr.Radio(
                         choices=[
-                            ("模式D: 0.8x降速 + PingPong往复闭环 [默认推荐，严格保持素材数1对1]", "stretch_08_pingpong"),
-                            ("模式C: 1.0x原速 + PingPong往复闭环 [严格保持素材数1对1]", "pingpong_1x"),
-                            ("模式A: 强制纯降速填满", "slow_down"),
-                            ("模式B: 强制原速循环复制 (会产生多段分裂片段)", "loop_copy")
+                            ("模式D: 0.8x降速 + PingPong[素材数1:1]", "stretch_08_pingpong"),
+                            ("模式C: 1.0x原速 + PingPong[素材数1:1]", "pingpong_1x"),
+                            ("模式B: 强制原速循环复制 (产生多段分裂片段)", "loop_copy"),
+                            ("模式A: 强制纯降速填满", "slow_down")
                         ],
                         value="stretch_08_pingpong",
                         label="视频填充策略"
                     )
                     snap_audio_chk = gr.Checkbox(value=True, label="🎵 音频断点自动截断（杜绝跨句越界）")
                     align_btn = gr.Button("⚡ 执行素材对齐字幕", variant="primary")
-                    align_result = gr.Textbox(label="执行日志", lines=6)
+                    # 固定高度 11 行，超出在框内滚动，不撑长页面
+                    align_result = gr.Textbox(label="执行日志", lines=11, max_lines=11, autoscroll=True)
                     align_btn.click(
                         core_align_media_logic, 
                         inputs=[draft_path_input, project_dropdown, video_mode, snap_audio_chk], 
                         outputs=[align_result]
                     )
-
                 # 功能 2：批量随机运镜 (仅图片)
                 with gr.Column(variant="panel"):
                     gr.Markdown("#### 2. ✨ 批量随机运镜 (仅图片)")
@@ -1469,7 +1488,8 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                         pan_mag = gr.Number(value=0.12, label="位移幅度", precision=2)
                     blur_bg_chk = gr.Checkbox(value=True, label="🖼️ 开启高斯模糊背景填充 (防黑边)")
                     kf_btn = gr.Button("✨ 生成随机运镜关键帧", variant="primary")
-                    kf_result = gr.Textbox(label="运镜日志", lines=5)
+                    # 左右等高，同样固定 11 行
+                    kf_result = gr.Textbox(label="运镜日志", lines=11, max_lines=11, autoscroll=True)
                     kf_btn.click(
                         core_add_keyframes_only_logic, 
                         inputs=[draft_path_input, project_dropdown, zoom_min, zoom_max, pan_mag, blur_bg_chk], 
