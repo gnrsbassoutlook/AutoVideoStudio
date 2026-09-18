@@ -173,7 +173,6 @@ def build_pingpong_video(src_video_path: str, num_repeats: int) -> str:
         return str(out_path)
 
     # 构造复杂滤镜图：偶数位正放，奇数位反放
-    # 如 num_repeats=3: [0:v]split=3[v0][v1][v2]; [v1]reverse[r1]; [v0][r1][v2]concat=n=3:v=1[outv]
     splits = "".join([f"[v{i}]" for i in range(num_repeats)])
     filter_parts = [f"[0:v]split={num_repeats}{splits}"]
     
@@ -583,19 +582,127 @@ def core_clean_media_folder(folder_path_str, mode_choice, retain_filter="all"):
     return "\n".join(summary_log), str(parent_dir)
 
 # ==========================================
+# 2.1 文件名尾部字符智能截除算法 (Win / Mac 完美兼容)
+# ==========================================
+def core_trim_filename_suffix(folder_path_str, trim_count):
+    if not folder_path_str or not str(folder_path_str).strip():
+        return "❌ 请输入或粘贴文件夹路径！", ""
+    
+    clean_p = normalize_path(folder_path_str)
+    directory = Path(clean_p).resolve()
+    if not directory.exists() or not directory.is_dir():
+        return f"❌ 错误：路径不存在或不是文件夹: {clean_p}", ""
+
+    try:
+        k = int(trim_count)
+    except Exception:
+        return "❌ 删除字符数必须是一个有效正整数！", str(directory)
+
+    if k <= 0:
+        return "⚠️ 删除字符数必须大于 0！", str(directory)
+
+    raw_files = []
+    for item in sorted(directory.iterdir(), key=lambda p: p.name.lower()):
+        if item.is_file() and not item.name.startswith('.'):
+            raw_files.append(item)
+
+    if not raw_files:
+        return "💡 该文件夹中未找到任何可处理的文件！", str(directory)
+
+    rename_plans = []
+    used_names = set()
+
+    for item in raw_files:
+        stem = item.stem
+        ext = item.suffix
+        orig_name = item.name
+
+        # 规则 1：从后往前删 k 位；但若 stem 长度 <= k，至少留下首字符
+        if len(stem) <= k:
+            new_stem = stem[0] if len(stem) > 0 else "file"
+        else:
+            new_stem = stem[:-k]
+
+        # 规则 2：重名处理（-01, -02...）
+        cand_name = f"{new_stem}{ext}"
+        if cand_name in used_names:
+            dup_idx = 1
+            while True:
+                cand_name = f"{new_stem}-{dup_idx:02d}{ext}"
+                if cand_name not in used_names:
+                    break
+                dup_idx += 1
+
+        used_names.add(cand_name)
+        rename_plans.append({
+            'item': item,
+            'orig_name': orig_name,
+            'new_name': cand_name,
+            'is_changed': (orig_name != cand_name)
+        })
+
+    # 两阶段安全重命名
+    success_count = 0
+    unchanged_count = 0
+    logs = []
+    temp_plans = []
+
+    try:
+        for plan in rename_plans:
+            if not plan['is_changed']:
+                unchanged_count += 1
+                continue
+            item = plan['item']
+            temp_name = f"__tmp_{uuid.uuid4().hex[:8]}_{item.name}"
+            temp_path = item.parent / temp_name
+            item.rename(temp_path)
+            temp_plans.append({
+                'temp_path': temp_path,
+                'final_path': item.parent / plan['new_name'],
+                'orig_name': plan['orig_name'],
+                'new_name': plan['new_name']
+            })
+
+        for p in temp_plans:
+            p['temp_path'].rename(p['final_path'])
+            success_count += 1
+            logs.append(f"  ✏️ 重命名: [{p['orig_name']}] ➡️ [{p['new_name']}]")
+
+    except Exception as e:
+        return f"❌ 执行重命名时发生错误: {e}", str(directory)
+
+    summary = [
+        f"🎉 批量删除文件名后缀字符处理完成！",
+        f"📊 文件夹内文件总数: {len(raw_files)} | ✏️ 成功重命名: {success_count} 个 | ⏸️ 保持原名: {unchanged_count} 个",
+        f"📁 目标目录: {directory}",
+        "-" * 50,
+        "【执行明细】:"
+    ] + (logs if logs else ["  (没有文件需要被修改)"])
+
+    return "\n".join(summary), str(directory)
+
+# ==========================================
 # 3. 剪映草稿处理核心算法
 # ==========================================
 def scan_jianying_projects(draft_dir):
+    """
+    扫描草稿项目，按最后修改时间逆序排序（保证最新草稿永远排在第一个）
+    """
     clean_dir = normalize_path(draft_dir)
     if not clean_dir or not os.path.exists(clean_dir):
         return []
     try:
-        folders = []
+        folder_items = []
         for entry in os.listdir(clean_dir):
+            if entry.startswith('.'):
+                continue
             full_path = os.path.join(clean_dir, entry)
-            if os.path.isdir(full_path) and not entry.startswith('.'):
-                folders.append(str(entry))
-        return sorted(folders, key=lambda s: str(s).lower())
+            if os.path.isdir(full_path):
+                mtime = os.path.getmtime(full_path)
+                folder_items.append((str(entry), mtime))
+        # 核心：按真实物理修改时间从新到旧排序
+        folder_items.sort(key=lambda x: x[1], reverse=True)
+        return [f[0] for f in folder_items]
     except Exception as e:
         print(f"扫描草稿目录错误: {e}")
         return []
@@ -656,13 +763,68 @@ def resolve_jianying_material_path(raw_path: str, project_dir: str):
         # 模式二：保留在原有位置 -> 直接使用原生路径
         return normalize_path(raw_path), None
 
+# --- 新增：给草稿工程增加 / 删除年份时间戳算法 ---
+def core_modify_draft_year_prefix(draft_dir, current_project, action="add"):
+    """
+    action: "add" -> 增加当前年份 (如 9月18日 -> 2026年9月18日)
+    action: "remove" -> 删除年份前缀 (如 2026年9月18日 -> 9月18日)
+    """
+    clean_dir = normalize_path(draft_dir)
+    if not clean_dir or not current_project:
+        return gr.update(), "❌ 未提供有效的草稿根目录或当前未选中任何工程！"
+
+    src_dir = os.path.join(clean_dir, str(current_project))
+    if not os.path.exists(src_dir):
+        return gr.update(), f"❌ 找不到对应工程文件夹: {src_dir}"
+
+    curr_name = str(current_project).strip()
+    now_year = datetime.datetime.now().year
+    
+    if action == "add":
+        # 检查是否已包含对应年份前缀
+        if curr_name.startswith(f"{now_year}年"):
+            return gr.update(), f"ℹ️ 工程 [{curr_name}] 已经包含 {now_year} 年份前缀，无需重复添加！"
+        new_name = f"{now_year}年{curr_name}"
+    else:  # remove
+        # 智能匹配开头的 4位数字+年 (例如 2026年, 2025年, 2024年)
+        new_name = re.sub(r'^\d{4}年', '', curr_name).strip()
+        if new_name == curr_name:
+            return gr.update(), f"ℹ️ 工程 [{curr_name}] 开头未检测到 4 位年份前缀，无需删除！"
+
+    target_dir = os.path.join(clean_dir, new_name)
+    if os.path.exists(target_dir):
+        return gr.update(), f"❌ 目标名称 [{new_name}] 已存在同名工程文件夹，为保护数据已终止改名！"
+
+    try:
+        # 1. 物理重命名工程目录
+        os.rename(src_dir, target_dir)
+
+        # 2. 同步尝试修正草稿内部 json 的显示名称 (若存在)
+        draft_json_path = get_draft_json_file(target_dir)
+        if os.path.exists(draft_json_path):
+            try:
+                with open(draft_json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if "draft_name" in data:
+                    data["draft_name"] = new_name
+                if "name" in data:
+                    data["name"] = new_name
+                with open(draft_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        # 3. 重新扫描草稿列表，并自动选中改名后的全新工程
+        fresh_projects = scan_jianying_projects(clean_dir)
+        save_config({"base_drafts_dir": clean_dir, "last_selected_project": new_name})
+        
+        act_msg = f"已成功添加年份前缀 [{now_year}年]" if action == "add" else "已成功移除年份前缀"
+        return gr.update(choices=fresh_projects, value=new_name), f"✅ 操作成功！{act_msg}: [{curr_name}] ➡️ [{new_name}]"
+
+    except Exception as e:
+        return gr.update(), f"❌ 重命名草稿工程失败: {e}"
+
 def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingpong", snap_audio_boundary=True):
-    """
-    图文/视频轨道自动对齐
-    1. 首分镜顶头(0)
-    2. 每个分镜的终点绝对以【下一句字幕起点】或【音频真实断点】为收刀线，绝不擅自捅到全片尾巴！
-    3. 智能锁定分片最多的真正字幕轨道
-    """
     clean_dir = normalize_path(draft_dir)
     if not clean_dir or not project_name:
         yield "❌ 请选择剪映草稿目录和工程名称！"
@@ -684,7 +846,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
     if not video_track or not text_tracks:
         yield "❌ 错误：草稿中必须包含至少一条【主视频/图片轨道】和一条【有效字幕轨道】！"
         return
-    # 1. 扫描所有音频物理片段
     raw_audio_clips = []
     for t in tracks:
         if t.get("type") == "audio":
@@ -695,7 +856,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
                 if dt > 0:
                     raw_audio_clips.append({"start": st, "end": st + dt})
     raw_audio_clips.sort(key=lambda x: x["start"])
-    # 2. 纯粹直连：锁定唯一的主字幕轨作为标尺
     if len(text_tracks) > 1:
         text_track = max(text_tracks, key=lambda t: len(t.get("segments", [])))
     else:
@@ -722,18 +882,15 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
         else:
             speed_mat["speed"] = float(speed_val)
         seg["speed"] = float(speed_val)
-    # 3. 核心：计算每个分镜的严格物理区间
     computed_spans = []
     for i in range(num_pairs):
         cur_t_st = int(t_segs[i].get("target_timerange", {}).get("start", 0))
         cur_t_dt = int(t_segs[i].get("target_timerange", {}).get("duration", 1000000))
         
-        # 终点首先看有没有下一句字幕（以全部字幕为准，绝不仅看视频数量！）
         if i < len(t_segs) - 1:
             next_t_st = int(t_segs[i+1].get("target_timerange", {}).get("start", cur_t_st + cur_t_dt))
         else:
             next_t_st = cur_t_st + cur_t_dt
-        # 起点计算：第0个死死顶头0；其余严格以字幕或新音频起始为界
         if i == 0:
             seg_start = 0
         else:
@@ -744,9 +901,7 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
                     if prev_base < clip["start"] <= cur_t_st:
                         seg_start = clip["start"]
                         break
-        # 终点默认吸附到下一句字幕头
         seg_end = next_t_st
-        # 音频截断判断：如果在 [seg_start, seg_end] 之间音频结束了，必须在该音频尾截断！
         if snap_audio_boundary and raw_audio_clips:
             possible_cuts = []
             for clip in raw_audio_clips:
@@ -764,7 +919,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
     new_video_segments = []
     live_logs = [f"🚀 正在分析草稿分镜 (共 {num_pairs} 对)...已锁定严格字幕间隙标尺"]
     yield "\n".join(live_logs)
-    # 4. 执行应用与 PingPong (按需渲染，绝不过度延伸)
     for i in range(num_pairs):
         v = v_segs[i]
         mat_id = v.get("material_id")
@@ -786,7 +940,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
             new_video_segments.append(v)
             mod_count += 1
         else:
-            # 模式 D: 0.8x + PingPong
             if video_mode == "stretch_08_pingpong":
                 fixed_speed = 0.8
                 source_needed = int(dur * fixed_speed)
@@ -827,7 +980,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
                     set_speed_material(v, fixed_speed)
                     new_video_segments.append(v)
                     mod_count += 1
-            # 模式 C: 1.0x + PingPong
             elif video_mode == "pingpong_1x":
                 if raw_vid_dur >= dur:
                     v["target_timerange"] = {"start": seg_start, "duration": dur}
@@ -866,7 +1018,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
                     set_speed_material(v, 1.0)
                     new_video_segments.append(v)
                     mod_count += 1
-            # 模式 A: 纯降速
             elif video_mode == "slow_down":
                 if raw_vid_dur >= dur:
                     v["target_timerange"] = {"start": seg_start, "duration": dur}
@@ -879,7 +1030,6 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
                     set_speed_material(v, calc_speed)
                 new_video_segments.append(v)
                 mod_count += 1
-            # 模式 B: 原速循环复制
             elif video_mode == "loop_copy":
                 if raw_vid_dur >= dur:
                     v["target_timerange"] = {"start": seg_start, "duration": dur}
@@ -1036,9 +1186,9 @@ def core_subtitle_styling_logic(draft_dir, project_name, sub_pixel_y=-600, font_
         txt["border_alpha"] = 1.0
         txt["border_color"] = "#000000"
         txt["border_width"] = stroke_width_val
-        txt["alignment"] = 1                   # 居中对齐
-        txt["preset_has_set_alignment"] = True # 预设居中生效
-        txt["typesetting"] = 0                 # 横排
+        txt["alignment"] = 1
+        txt["preset_has_set_alignment"] = True
+        txt["typesetting"] = 0
         txt["use_effect_default_color"] = True
 
         raw_content = txt.get("content", "")
@@ -1301,6 +1451,7 @@ def core_generate_audio_title_track(draft_dir, project_name, split_char=".", fon
 cfg = load_config()
 initial_projects = scan_jianying_projects(cfg.get("base_drafts_dir", ""))
 saved_proj = str(cfg.get("last_selected_project", ""))
+# 排序后首个元素始终为最新创建/修改的项目
 initial_proj_value = saved_proj if saved_proj in initial_projects else (initial_projects[0] if initial_projects else None)
 init_y, init_size, init_scale, init_stroke = inspect_draft_aspect_ratio(cfg.get("base_drafts_dir", ""), initial_proj_value)
 
@@ -1434,6 +1585,35 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                     )
                     clean_media_open_btn.click(open_folder_in_explorer, inputs=[media_backup_dir_state], outputs=[])
 
+            gr.Markdown("---")
+            # --- 5. 文件名尾部字符智能截除 ---
+            with gr.Row():
+                with gr.Column(variant="panel"):
+                    gr.Markdown("### 📌 5. 批量从文件名尾部截除字符")
+                    gr.Markdown(
+                        "💡 **使用说明**：针对文件夹内所有文件，从文件名（不含扩展名后缀）**尾部向前**批量删除指定字数。\n"
+                        "🛡️ **保护机制**：若原文件名字数 $\\le$ 删除字数，将**至少保留第 1 个字符**；若删减后产生同名文件，自动追加 **-01, -02** 防止覆盖。"
+                    )
+                    with gr.Row():
+                        trim_folder_in = gr.Textbox(
+                            label="目标文件夹路径 (支持带双引号粘贴)", 
+                            placeholder="例如: \"F:\\CF\\MyAssets\" 或 /Users/.../MyAssets",
+                            scale=4
+                        )
+                        trim_count_in = gr.Number(value=6, label="尾部删除字符数", precision=0, scale=1)
+                    with gr.Row():
+                        trim_run_btn = gr.Button("✂️ 开始批量重命名", variant="primary", scale=2)
+                        trim_open_btn = gr.Button("📂 打开目标文件夹", scale=1)
+                    trim_log_box = gr.Textbox(label="执行与重命名日志", lines=8)
+                    trim_folder_state = gr.State("")
+
+                    trim_run_btn.click(
+                        core_trim_filename_suffix,
+                        inputs=[trim_folder_in, trim_count_in],
+                        outputs=[trim_log_box, trim_folder_state]
+                    )
+                    trim_open_btn.click(open_folder_in_explorer, inputs=[trim_folder_state], outputs=[])
+
         # ========================================================
         # 板块二：剪映工程自动化处理中心
         # ========================================================
@@ -1447,12 +1627,20 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                         scale=4
                     )
                     refresh_btn = gr.Button("🔄 刷新项目列表", scale=1)
-                project_dropdown = gr.Dropdown(
-                    choices=initial_projects,
-                    value=initial_proj_value,
-                    label="当前选择的剪映草稿工程",
-                    interactive=True
-                )
+                
+                # 下拉选择框与年份时间戳操作按钮紧凑组合
+                with gr.Row():
+                    project_dropdown = gr.Dropdown(
+                        choices=initial_projects,
+                        value=initial_proj_value,
+                        label="当前选择的剪映草稿工程 (最新草稿置顶于首位)",
+                        interactive=True,
+                        scale=4
+                    )
+                    add_year_btn = gr.Button("➕ 加年份前缀", scale=1)
+                    remove_year_btn = gr.Button("➖ 删年份前缀", scale=1)
+
+                draft_rename_tip = gr.Markdown("💡 **提示**：选中工程后点击加/删年份，将自动重命名文件夹并在工程内同步更新！最新修改的草稿永远保持在最上方。")
 
             with gr.Row():
                 # 功能 1：图文/视频自动吸附
@@ -1471,7 +1659,6 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                     )
                     snap_audio_chk = gr.Checkbox(value=True, label="🎵 音频断点自动截断（杜绝跨句越界）")
                     align_btn = gr.Button("⚡ 执行素材对齐字幕", variant="primary")
-                    # 固定高度 11 行，超出在框内滚动，不撑长页面
                     align_result = gr.Textbox(label="执行日志", lines=11, max_lines=11, autoscroll=True)
                     align_btn.click(
                         core_align_media_logic, 
@@ -1488,7 +1675,6 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                         pan_mag = gr.Number(value=0.12, label="位移幅度", precision=2)
                     blur_bg_chk = gr.Checkbox(value=True, label="🖼️ 开启高斯模糊背景填充 (防黑边)")
                     kf_btn = gr.Button("✨ 生成随机运镜关键帧", variant="primary")
-                    # 左右等高，同样固定 11 行
                     kf_result = gr.Textbox(label="运镜日志", lines=11, max_lines=11, autoscroll=True)
                     kf_btn.click(
                         core_add_keyframes_only_logic, 
@@ -1497,7 +1683,7 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                     )
 
             with gr.Row():
-                # 功能 3：字幕效果处理（独立板块）
+                # 功能 3：字幕效果处理
                 with gr.Column(variant="panel"):
                     gr.Markdown("#### 3. 💬 字幕效果与样式处理")
                     gr.Markdown("强制应用【白底黑框】、居中对齐、精准调整 Y 轴安全区、缩放与描边粗细。")
@@ -1558,6 +1744,7 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                 projs = scan_jianying_projects(clean_path)
                 cur_cfg = load_config()
                 last_p = str(cur_cfg.get("last_selected_project", ""))
+                # 默认优先保留当前选择；如果当前没有或失效，首选排序第一的最新工程
                 chosen = last_p if last_p in projs else (projs[0] if projs else None)
                 save_config({"base_drafts_dir": clean_path, "last_selected_project": chosen or ""})
                 rec_y, rec_size, rec_scale, rec_stroke = inspect_draft_aspect_ratio(clean_path, chosen)
@@ -1570,9 +1757,20 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                 rec_y, rec_size, rec_scale, rec_stroke = inspect_draft_aspect_ratio(clean_path, proj)
                 return rec_y, rec_size, rec_scale, rec_stroke
 
+            # 刷新与联动
             draft_path_input.change(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider])
             refresh_btn.click(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider])
             project_dropdown.change(on_proj_change, inputs=[draft_path_input, project_dropdown], outputs=[sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider])
+
+            # 年份前缀按钮回调
+            def on_add_year(path, proj):
+                return core_modify_draft_year_prefix(path, proj, action="add")
+
+            def on_remove_year(path, proj):
+                return core_modify_draft_year_prefix(path, proj, action="remove")
+
+            add_year_btn.click(on_add_year, inputs=[draft_path_input, project_dropdown], outputs=[project_dropdown, draft_rename_tip])
+            remove_year_btn.click(on_remove_year, inputs=[draft_path_input, project_dropdown], outputs=[project_dropdown, draft_rename_tip])
 
 # ==========================================
 # 5. 启动入口
