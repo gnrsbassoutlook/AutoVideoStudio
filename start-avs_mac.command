@@ -16,4 +16,4 @@ fi
 pip3 install -r requirements.txt -q
 
 # 启动服务
-python3 app.py
+python3 AutoVideoStudio.py
