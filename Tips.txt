@@ -7,6 +7,7 @@
 # ==========================
 chmod +x *.command
 
+
 # 执行完成之后，就可以直接双击 *.command 文件运行
 # 如果提示"无法打开，因为来自未识别的开发者"：右键文件 → 打开，仅需要操作一次解除安全限制
 # 如果报换行符错误：zsh: /Users/gnrsbass/Desktop/AutoVideoStudio/start-avs_mac.command: bad interpreter: /bin/bash^M: no such file or directory    请执行：
