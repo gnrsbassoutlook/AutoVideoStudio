@@ -4,9 +4,32 @@
 
 ---
 
-写在最前面，一定要记得：  
-chmod +x /Users/bd107c/Desktop/AutoVideoStudio/*.command
-sudo xattr -d com.apple.quarantine /Users/bd107c/Desktop/AutoVideoStudio/*.command
+## 🍎 Mac 用户第一次请先双击 `init.command`
+
+`git clone` / 下载到本地后，**先双击运行一次 `init.command`**，再双击 `start-avs_mac.command` 等任何脚本。
+
+**为什么要多这一步**：macOS 会给从网络来的文件打**隔离属性**（`com.apple.quarantine`），而 zip 解压、网盘下载、跨盘拷贝还会顺手把脚本的**可执行位**（`chmod +x`）弄丢。两种情况症状不同：
+
+| 症状 | 原因 |
+| --- | --- |
+| 双击报「无法打开，因为来自身份不明的开发者」 | 隔离属性没清（Gatekeeper 拦截） |
+| 双击**完全没反应**，毫无提示 | 可执行位丢了 |
+
+`init.command` 一次性把这两件事做完，省得逐个 `chmod` / `xattr` 敲一遍：
+
+- 给目录下所有 `*.command` / `*.sh` 补回可执行权限
+- 清掉 `com.apple.quarantine`（这就是触发弹窗的元凶）
+- 顺带体检：哪个脚本被转成了 Windows 的 CRLF 换行会一并提醒（CRLF 会报 `bad interpreter ... ^M`）
+
+终端里跑也一样：
+
+```bash
+cd /path/to/AutoVideoStudio
+chmod +x init.command     # 万一它自己也没权限
+./init.command
+```
+
+> Windows 不需要这一步 —— 隔离属性和 Unix 可执行位都是 macOS 独有的东西。
 
 ## ✨ 核心特性
 
@@ -33,16 +56,41 @@ sudo xattr -d com.apple.quarantine /Users/bd107c/Desktop/AutoVideoStudio/*.comma
 ```bash
 git clone https://github.com/gnrsbassoutlook/AutoVideoStudio.git
 cd AutoVideoStudio
+```
 
-### 2. 安装依赖
-Bash
+### 2. 【Mac 必做】跑一次 `init.command`
+
+双击 `init.command`，给所有 `.command` 脚本补回可执行权限并解除隔离属性，原因见上一节。
+
+终端等价写法：
+
+```bash
+chmod +x *.command
+xattr -dr com.apple.quarantine .
+```
+
+> Windows 跳过这一步。
+
+### 3. 安装依赖
+
+```bash
 pip install -r requirements.txt
+```
 
-### 3. 启动 WebUI
-Bash
-python3 app.py
-Mac 权限设置提示：
-在 Mac 终端运行一次 chmod +x start_mac.command，以后就可以直接双击此文件运行了。
+### 4. 启动
+
+| 平台 | 双击这个 |
+| --- | --- |
+| Mac | `start-avs_mac.command` |
+| Windows | `start-avs_win.bat` |
+
+终端等价：
+
+```bash
+python3 AutoVideoStudio.py
+```
+
+> 之前文档里写的 `python3 app.py` 是笔误，主程序文件是 `AutoVideoStudio.py`。
 
 ---
 
@@ -69,12 +117,26 @@ Mac 权限设置提示：
 5. 本地有未提交改动时自动 `stash`（可用 `git stash pop` 取回），不会弄丢你的东西
 6. 同步完列出本次变动的文件，并询问是否更新依赖
 
-> Mac 上 `.command` 首次运行前需要执行一次：`chmod +x *.command`
-> 若提示 `bad interpreter ... ^M`，说明文件被转成了 CRLF，执行 `sed -i '' 's/\r$//' *.command`
+> **首次使用请先双击一次 `init.command`**（见文章开头）：它等价于 `chmod +x *.command` + 清 `com.apple.quarantine`，Windows 不需要。
+> 若提示 `bad interpreter ... ^M`，说明文件被转成了 CRLF，执行 `sed -i '' 's/\r$//' *.command`。
 
 ---
 
 ## 🔒 附：JianyingPro59Guard.exe — 剪映专业版 5.9 版本锁定守护
+
+### 为什么仓库里会有一个 .exe
+
+因为这个项目的自动化，**严重依赖剪映专业版 5.9 的草稿结构和行为**——草稿目录、版本目录、素材与轨道排布、缩略图缓存位置，都是对着 5.9 写的。
+
+但 PC 上的剪映并不老实：
+
+- **自己偷偷升级**：后台静默拉新版，某天打开发现界面和草稿结构都变了；
+- **被第三方管家代升级**：像 360 软件助手这类工具会"顺手"帮你把软件更到最新。
+
+一旦被升上去，这边的自动化链路就可能整条失效，而排查起来极其费时间。**与其每次出事再救火，不如从源头把版本钉死。**
+
+于是有了这个纯 Windows 的守护小工具：让剪映**停在 5.9 不动**，谁来升都不好使。
+🍎 **Mac 用户请直接忽略这个文件**，它跟 macOS 无关，也永远不会被执行；它的存在只是为了让 Windows 机器 clone 下来后开箱即用。
 
 ### 它是干嘛的
 
@@ -99,8 +161,8 @@ Mac 权限设置提示：
 
 ```
 
-[1] 安装守护       → 提示选模式时输入 S（严格模式）  
-[8] 创建完整备份   → 约 1.3G，被破坏后唯一能完整回滚的手段，建议做  
+[1] 安装守护       → 提示选模式时输入 S（严格模式）
+[8] 创建完整备份   → 约 1.3G，被破坏后唯一能完整回滚的手段，建议做
 [2] 立即体检       → 确认显示"正常"就装好了
 
 ```
@@ -127,4 +189,3 @@ Mac 权限设置提示：
 工具提供 `[12] 阉割 / 还原`：保留文件名、内容置 0 字节。
 这样调用者找得到文件不会报错，执行起来什么都不会发生，而且随时能还原。
 默认是**不处理**的，需要你自己选择。
-```
