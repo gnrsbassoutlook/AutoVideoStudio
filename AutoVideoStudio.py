@@ -49,7 +49,8 @@ def load_config():
     """读取本地配置"""
     default_cfg = {
         "base_drafts_dir": get_default_draft_path(),
-        "last_selected_project": ""
+        "last_selected_project": "",
+        "server_port": 7860
     }
     if os.path.exists(CONFIG_FILE):
         try:
@@ -153,8 +154,6 @@ def get_ffprobe_duration_us(video_path):
 def build_pingpong_video(src_video_path: str, num_repeats: int) -> str:
     """
     通过 FFmpeg 渲染正放+倒放相间的无缝 PingPong 实体视频（静音纯净画面）
-    num_repeats: 拼接总片数（>=2），例如 2 片: 正+反；3 片: 正+反+正
-    返回生成后的本地视频绝对路径
     """
     src_p = Path(src_video_path).resolve()
     ffmpeg_bin = get_ffmpeg_executable()
@@ -163,16 +162,13 @@ def build_pingpong_video(src_video_path: str, num_repeats: int) -> str:
 
     out_name = f"{src_p.stem}_pingpong_{num_repeats}x{src_p.suffix}"
     out_dir = src_p.parent
-    # 若源目录不可写，退回 outputs 目录
     if not os.access(out_dir, os.W_OK):
         out_dir = Path(OUTPUTS_DIR)
     out_path = out_dir / out_name
 
-    # 若之前已生成过且文件存在，直接复用
     if out_path.exists() and out_path.stat().st_size > 1000:
         return str(out_path)
 
-    # 构造复杂滤镜图：偶数位正放，奇数位反放
     splits = "".join([f"[v{i}]" for i in range(num_repeats)])
     filter_parts = [f"[0:v]split={num_repeats}{splits}"]
     
@@ -617,13 +613,11 @@ def core_trim_filename_suffix(folder_path_str, trim_count):
         ext = item.suffix
         orig_name = item.name
 
-        # 规则 1：从后往前删 k 位；但若 stem 长度 <= k，至少留下首字符
         if len(stem) <= k:
             new_stem = stem[0] if len(stem) > 0 else "file"
         else:
             new_stem = stem[:-k]
 
-        # 规则 2：重名处理（-01, -02...）
         cand_name = f"{new_stem}{ext}"
         if cand_name in used_names:
             dup_idx = 1
@@ -641,7 +635,6 @@ def core_trim_filename_suffix(folder_path_str, trim_count):
             'is_changed': (orig_name != cand_name)
         })
 
-    # 两阶段安全重命名
     success_count = 0
     unchanged_count = 0
     logs = []
@@ -700,7 +693,6 @@ def scan_jianying_projects(draft_dir):
             if os.path.isdir(full_path):
                 mtime = os.path.getmtime(full_path)
                 folder_items.append((str(entry), mtime))
-        # 核心：按真实物理修改时间从新到旧排序
         folder_items.sort(key=lambda x: x[1], reverse=True)
         return [f[0] for f in folder_items]
     except Exception as e:
@@ -743,12 +735,6 @@ def inspect_draft_aspect_ratio(draft_dir, project_name):
     return -600, 8.0, 115, 30
 
 def resolve_jianying_material_path(raw_path: str, project_dir: str):
-    """
-    自适应兼容两种素材模式：
-    1. 复制至草稿（带 ##_draftpath_placeholder_xxx_## 占位符）
-    2. 保留在原有位置（外部真实绝对路径）
-    返回: (真实可读写的物理路径, 原始占位符前缀/None)
-    """
     if not raw_path:
         return "", None
     
@@ -756,50 +742,94 @@ def resolve_jianying_material_path(raw_path: str, project_dir: str):
     placeholder_token = placeholder_match.group(1) if placeholder_match else None
 
     if placeholder_token:
-        # 模式一：复制至草稿 -> 还原为工程内的真实路径
         real_path = raw_path.replace(placeholder_token, project_dir)
         return normalize_path(real_path), placeholder_token
     else:
-        # 模式二：保留在原有位置 -> 直接使用原生路径
         return normalize_path(raw_path), None
 
-# --- 新增：给草稿工程增加 / 删除年份时间戳算法 ---
-def core_modify_draft_year_prefix(draft_dir, current_project, action="add"):
-    """
-    action: "add" -> 增加当前年份 (如 9月18日 -> 2026年9月18日)
-    action: "remove" -> 删除年份前缀 (如 2026年9月18日 -> 9月18日)
-    """
+def touch_dir_mtime(dir_path: str):
+    """刷新目录修改时间戳，确保最新改动排在最上方"""
+    try:
+        os.utime(dir_path, None)
+    except Exception:
+        pass
+
+# --- 草稿重命名功能（直接改名） ---
+def core_rename_draft_project(draft_dir, current_project, new_name):
+    """直接重命名剪映草稿工程文件夹及内部 json 显示名"""
     clean_dir = normalize_path(draft_dir)
     if not clean_dir or not current_project:
-        return gr.update(), "❌ 未提供有效的草稿根目录或当前未选中任何工程！"
+        return gr.update(), gr.update(), "❌ 未提供有效的草稿根目录或当前未选中工程！"
+
+    target_new_name = str(new_name).strip()
+    if not target_new_name:
+        return gr.update(), gr.update(), "❌ 新工程名称不能为空！"
+
+    # 过滤系统非法字符
+    target_new_name = re.sub(r'[\\/:*?"<>|]', '_', target_new_name).strip()
+
+    if target_new_name == str(current_project).strip():
+        return gr.update(), gr.update(), f"ℹ️ 工程名称未发生改变: [{current_project}]"
+
+    src_dir = os.path.join(clean_dir, str(current_project))
+    dest_dir = os.path.join(clean_dir, target_new_name)
+
+    if not os.path.exists(src_dir):
+        return gr.update(), gr.update(), f"❌ 找不到原工程文件夹: {src_dir}"
+    if os.path.exists(dest_dir):
+        return gr.update(), gr.update(), f"❌ 目标名称 [{target_new_name}] 已存在同名工程文件夹，已中止操作！"
+
+    try:
+        os.rename(src_dir, dest_dir)
+        draft_json_path = get_draft_json_file(dest_dir)
+        if os.path.exists(draft_json_path):
+            try:
+                with open(draft_json_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if "draft_name" in data:
+                    data["draft_name"] = target_new_name
+                if "name" in data:
+                    data["name"] = target_new_name
+                with open(draft_json_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+        touch_dir_mtime(dest_dir)
+        fresh_projects = scan_jianying_projects(clean_dir)
+        save_config({"base_drafts_dir": clean_dir, "last_selected_project": target_new_name})
+        return gr.update(choices=fresh_projects, value=target_new_name), target_new_name, f"✅ 工程已重命名: [{current_project}] ➡️ [{target_new_name}]"
+    except Exception as e:
+        return gr.update(), gr.update(), f"❌ 重命名工程失败: {e}"
+
+# --- 年份前缀增删算法 ---
+def core_modify_draft_year_prefix(draft_dir, current_project, action="add"):
+    clean_dir = normalize_path(draft_dir)
+    if not clean_dir or not current_project:
+        return gr.update(), gr.update(), "❌ 未提供有效的草稿根目录或当前未选中任何工程！"
 
     src_dir = os.path.join(clean_dir, str(current_project))
     if not os.path.exists(src_dir):
-        return gr.update(), f"❌ 找不到对应工程文件夹: {src_dir}"
+        return gr.update(), gr.update(), f"❌ 找不到对应工程文件夹: {src_dir}"
 
     curr_name = str(current_project).strip()
     now_year = datetime.datetime.now().year
     
     if action == "add":
-        # 检查是否已包含对应年份前缀
         if curr_name.startswith(f"{now_year}年"):
-            return gr.update(), f"ℹ️ 工程 [{curr_name}] 已经包含 {now_year} 年份前缀，无需重复添加！"
+            return gr.update(), gr.update(), f"ℹ️ 工程 [{curr_name}] 已经包含 {now_year} 年份前缀，无需重复添加！"
         new_name = f"{now_year}年{curr_name}"
     else:  # remove
-        # 智能匹配开头的 4位数字+年 (例如 2026年, 2025年, 2024年)
         new_name = re.sub(r'^\d{4}年', '', curr_name).strip()
         if new_name == curr_name:
-            return gr.update(), f"ℹ️ 工程 [{curr_name}] 开头未检测到 4 位年份前缀，无需删除！"
+            return gr.update(), gr.update(), f"ℹ️ 工程 [{curr_name}] 开头未检测到 4 位年份前缀，无需删除！"
 
     target_dir = os.path.join(clean_dir, new_name)
     if os.path.exists(target_dir):
-        return gr.update(), f"❌ 目标名称 [{new_name}] 已存在同名工程文件夹，为保护数据已终止改名！"
+        return gr.update(), gr.update(), f"❌ 目标名称 [{new_name}] 已存在同名工程文件夹，为保护数据已终止改名！"
 
     try:
-        # 1. 物理重命名工程目录
         os.rename(src_dir, target_dir)
-
-        # 2. 同步尝试修正草稿内部 json 的显示名称 (若存在)
         draft_json_path = get_draft_json_file(target_dir)
         if os.path.exists(draft_json_path):
             try:
@@ -814,15 +844,119 @@ def core_modify_draft_year_prefix(draft_dir, current_project, action="add"):
             except Exception:
                 pass
 
-        # 3. 重新扫描草稿列表，并自动选中改名后的全新工程
+        touch_dir_mtime(target_dir)
         fresh_projects = scan_jianying_projects(clean_dir)
         save_config({"base_drafts_dir": clean_dir, "last_selected_project": new_name})
-        
         act_msg = f"已成功添加年份前缀 [{now_year}年]" if action == "add" else "已成功移除年份前缀"
-        return gr.update(choices=fresh_projects, value=new_name), f"✅ 操作成功！{act_msg}: [{curr_name}] ➡️ [{new_name}]"
-
+        return gr.update(choices=fresh_projects, value=new_name), new_name, f"✅ 操作成功！{act_msg}: [{curr_name}] ➡️ [{new_name}]"
     except Exception as e:
-        return gr.update(), f"❌ 重命名草稿工程失败: {e}"
+        return gr.update(), gr.update(), f"❌ 操作工程前缀失败: {e}"
+
+# --- 横屏/竖屏针对性转换核心算法 ---
+def core_convert_draft_aspect(draft_dir, project_name, target_aspect="horizontal"):
+    """
+    指定将草稿工程转换为 横屏(16:9) 或 竖屏(9:16)，并自动自适应调整字幕尺寸与安全区
+    target_aspect: 'horizontal' (横屏) 或 'vertical' (竖屏)
+    """
+    clean_dir = normalize_path(draft_dir)
+    if not clean_dir or not project_name:
+        return gr.update(), "❌ 未选择剪映草稿目录或未选定工程！", gr.update(), gr.update(), gr.update(), gr.update()
+
+    project_dir = os.path.join(clean_dir, str(project_name))
+    draft_json_path = get_draft_json_file(project_dir)
+    if not os.path.exists(draft_json_path):
+        return gr.update(), f"❌ 未找到工程配置文件: {draft_json_path}", gr.update(), gr.update(), gr.update(), gr.update()
+
+    backup_path = backup_draft_json(draft_json_path, f"{target_aspect}_bak")
+    try:
+        with open(draft_json_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        canvas_cfg = data.setdefault("canvas_config", {})
+
+        if target_aspect == "horizontal":
+            # 目标：16:9 横屏 (1920x1080)
+            new_width = 1920
+            new_height = 1080
+            new_ratio = "16:9"
+            new_sub_y = -380
+            new_font_size = 5.0
+            new_scale = 1.0
+            new_stroke = 30
+            mode_label = "🖥️ 横屏 (16:9, 1920×1080)"
+        else:
+            # 目标：9:16 竖屏 (1080x1920)
+            new_width = 1080
+            new_height = 1920
+            new_ratio = "9:16"
+            new_sub_y = -600
+            new_font_size = 8.0
+            new_scale = 1.15
+            new_stroke = 30
+            mode_label = "📱 竖屏 (9:16, 1080×1920)"
+
+        canvas_cfg["width"] = new_width
+        canvas_cfg["height"] = new_height
+        canvas_cfg["ratio"] = new_ratio
+
+        norm_y = float(new_sub_y) / float(new_height)
+        stroke_width_val = float(new_stroke) * 0.002
+
+        for txt in data.get("materials", {}).get("texts", []):
+            txt["font_size"] = float(new_font_size)
+            raw_content = txt.get("content", "")
+            if raw_content:
+                try:
+                    c_data = json.loads(raw_content)
+                    raw_text_str = c_data.get("text", "")
+                    text_len = len(raw_text_str)
+                    styles = c_data.get("styles", [])
+                    if styles:
+                        for st in styles:
+                            st["size"] = float(new_font_size)
+                            st["strokes"] = [{"width": stroke_width_val, "content": {"solid": {"color": [0.0, 0.0, 0.0]}}}]
+                    else:
+                        c_data["styles"] = [{
+                            "fill": {"content": {"solid": {"color": [1.0, 1.0, 1.0]}}},
+                            "range": [0, text_len],
+                            "strokes": [{"width": stroke_width_val, "content": {"solid": {"color": [0.0, 0.0, 0.0]}}}],
+                            "useLetterColor": True,
+                            "size": float(new_font_size),
+                            "font": {"path": "/Applications/VideoFusion-macOS.app/Contents/Resources/Font/SystemFont/zh-hans.ttf", "id": ""}
+                        }]
+                    txt["content"] = json.dumps(c_data, ensure_ascii=False)
+                except Exception:
+                    pass
+
+        for t in data.get("tracks", []):
+            if t.get("type") == "text":
+                for seg in t.get("segments", []):
+                    clip = seg.setdefault("clip", {})
+                    clip["scale"] = {"x": float(new_scale), "y": float(new_scale)}
+                    clip["transform"] = {"x": 0.0, "y": norm_y}
+
+        with open(draft_json_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        touch_dir_mtime(project_dir)
+        fresh_projects = scan_jianying_projects(clean_dir)
+        
+        msg = (
+            f"🎉 屏幕格式转换完成！已设为【{mode_label}】\n"
+            f"- 画布分辨率: {new_width} × {new_height}\n"
+            f"- 字幕智能匹配: 字号={new_font_size}, Y安全区={new_sub_y}px, 缩放={int(new_scale*100)}%\n"
+            f"- 自动备份: {os.path.basename(backup_path)}"
+        )
+        return (
+            gr.update(choices=fresh_projects, value=project_name),
+            msg,
+            new_sub_y,
+            new_font_size,
+            int(new_scale * 100),
+            new_stroke
+        )
+    except Exception as e:
+        return gr.update(), f"❌ 转换屏幕模式失败: {e}", gr.update(), gr.update(), gr.update(), gr.update()
 
 def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingpong", snap_audio_boundary=True):
     clean_dir = normalize_path(draft_dir)
@@ -1069,6 +1203,7 @@ def core_align_media_logic(draft_dir, project_name, video_mode="stretch_08_pingp
     snap_msg = "（已按音频物理断点严格截断对齐）" if snap_audio_boundary else ""
     pingpong_msg = f"\n🏓 PingPong 统计: 共对 {pingpong_rendered_count} 个素材完成了往复渲染填满，主轨分镜数保持 1:1（共 {len(new_video_segments)} 个分镜）！"
     live_logs.append(f"\n🎉 全部对齐成功！{snap_msg}{pingpong_msg}\n- 对齐片段数: {mod_count}\n- 视频轨道当前总长度: {max_track_end/1000000:.2f}秒\n- 自动备份: {os.path.basename(backup_path)}")
+    touch_dir_mtime(project_dir)
     yield "\n".join(live_logs)
 
 def core_add_keyframes_only_logic(draft_dir, project_name, zoom_min, zoom_max, pan_mag, auto_blur_bg=True):
@@ -1152,6 +1287,7 @@ def core_add_keyframes_only_logic(draft_dir, project_name, zoom_min, zoom_max, p
     with open(draft_json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+    touch_dir_mtime(project_dir)
     bg_msg = "（已开启高斯模糊背景填充）" if auto_blur_bg else ""
     return f"✨ 运镜处理完成！\n- 成功为 {mod_count} 个图片片段生成随机关键帧 {bg_msg}\n- 自动识别并跳过 {skipped_videos} 个原生视频素材\n- 自动备份: {os.path.basename(backup_path)}"
 
@@ -1225,6 +1361,7 @@ def core_subtitle_styling_logic(draft_dir, project_name, sub_pixel_y=-600, font_
     with open(draft_json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+    touch_dir_mtime(project_dir)
     return (
         f"💬 字幕效果处理完成！\n"
         f"- 统一设置 {mod_text_count} 条字幕为标准【白底黑框】\n"
@@ -1311,6 +1448,7 @@ def core_manage_video_audio_logic(draft_dir, project_name, action_type):
     with open(draft_json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
 
+    touch_dir_mtime(project_dir)
     if action_type == 'extract_only':
         return f"🎵 原声分离成功！已将 {processed_count} 个视频音频提取至全新独立音轨。\n- 自动备份: {os.path.basename(backup_path)}"
     else:
@@ -1411,7 +1549,7 @@ def core_generate_audio_title_track(draft_dir, project_name, split_char=".", fon
             "shadow_point": {"x": 0.6363961030678928, "y": -0.6363961030678927}, "shadow_smoothing": 0.45,
             "shape_clip_x": False, "shape_clip_y": False, "source_from": "", "style_name": "", "sub_type": 0,
             "subtitle_keywords": None, "subtitle_template_original_fontsize": 0.0, "text_alpha": 1.0, "text_color": "#ffffff",
-            "text_curve": None, "text_preset_resource_id": "", "text_size": 30, "text_to_audio_ids": [], "tts_auto_update": False,
+            "text_curve": None, "text_preset_resource_id": "", "text_size": 30, "text_to_audio_ids":[], "tts_auto_update": False,
             "type": "text", "typesetting": 0, "underline": False, "underline_offset": 0.22, "underline_width": 0.05,
             "use_effect_default_color": True, "words": {"end_time": [], "start_time": [], "text": []}
         }
@@ -1443,6 +1581,7 @@ def core_generate_audio_title_track(draft_dir, project_name, split_char=".", fon
     data["tracks"].append(new_track)
     with open(draft_json_path, 'w', encoding='utf-8') as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    touch_dir_mtime(project_dir)
     return f"🎵 音频标题轨创建成功！\n- 新增 {len(new_text_segments)} 个标题卡片\n- 自动备份: {os.path.basename(backup_path)}"
 
 # ==========================================
@@ -1454,6 +1593,7 @@ saved_proj = str(cfg.get("last_selected_project", ""))
 # 排序后首个元素始终为最新创建/修改的项目
 initial_proj_value = saved_proj if saved_proj in initial_projects else (initial_projects[0] if initial_projects else None)
 init_y, init_size, init_scale, init_stroke = inspect_draft_aspect_ratio(cfg.get("base_drafts_dir", ""), initial_proj_value)
+initial_port_val = int(cfg.get("server_port", 7860))
 
 with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
     gr.Markdown("# 🎙️ 智绘声影2.0+剪映自动视频工作台")
@@ -1618,29 +1758,49 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
         # 板块二：剪映工程自动化处理中心
         # ========================================================
         with gr.TabItem("🎬 剪映工程自动化处理中心"):
-            with gr.Accordion("📁 剪映草稿工程定位 (全局配置自动保存)", open=True):
-                with gr.Row():
+            with gr.Accordion("📁 剪映草稿工程管理与屏幕适配 (一排平摊 · 极简紧凑)", open=True):
+                # 第一排：草稿根目录 + 端口切换保存窗口（横向紧凑微调） + 刷新置顶按钮
+                with gr.Row(equal_height=True):
                     draft_path_input = gr.Textbox(
                         value=cfg.get("base_drafts_dir", ""),
                         label="剪映草稿根目录 (支持带双引号路径粘贴)",
                         placeholder="例如: C:\\Users\\xxx\\AppData\\Local\\JianyingPro\\User Data\\Projects\\com.lveditor.draft",
-                        scale=4
+                        scale=6
                     )
-                    refresh_btn = gr.Button("🔄 刷新项目列表", scale=1)
-                
-                # 下拉选择框与年份时间戳操作按钮紧凑组合
-                with gr.Row():
+                    port_input = gr.Number(
+                        value=initial_port_val,
+                        label="服务端口",
+                        precision=0,
+                        scale=1,
+                        min_width=75
+                    )
+                    save_port_btn = gr.Button("💾 存端口", scale=1, min_width=75)
+                    refresh_btn = gr.Button("🔄 刷新置顶", scale=1, min_width=95)
+
+                # 第二排：全功能横向平摊：选择工程、重命名输入、改名、加年份、删年份、转横屏、转竖屏
+                with gr.Row(equal_height=True):
                     project_dropdown = gr.Dropdown(
                         choices=initial_projects,
                         value=initial_proj_value,
-                        label="当前选择的剪映草稿工程 (最新草稿置顶于首位)",
+                        label="选择草稿工程 (最新排首位)",
                         interactive=True,
-                        scale=4
+                        scale=4,
+                        min_width=210
                     )
-                    add_year_btn = gr.Button("➕ 加年份前缀", scale=1)
-                    remove_year_btn = gr.Button("➖ 删年份前缀", scale=1)
+                    new_proj_name_input = gr.Textbox(
+                        value=initial_proj_value or "",
+                        label="重命名工程为",
+                        placeholder="输入新工程名",
+                        scale=3,
+                        min_width=160
+                    )
+                    rename_proj_btn = gr.Button("✏️ 改名", scale=1, min_width=75)
+                    add_year_btn = gr.Button("➕ 加年份", scale=1, min_width=78)
+                    remove_year_btn = gr.Button("➖ 删年份", scale=1, min_width=78)
+                    set_landscape_btn = gr.Button("🖥️ 转横屏", variant="secondary", scale=1, min_width=85)
+                    set_portrait_btn = gr.Button("📱 转竖屏", variant="secondary", scale=1, min_width=85)
 
-                draft_rename_tip = gr.Markdown("💡 **提示**：选中工程后点击加/删年份，将自动重命名文件夹并在工程内同步更新！最新修改的草稿永远保持在最上方。")
+                draft_rename_tip = gr.Markdown("💡 **提示**：最新改动工程物理置顶首位。点击【改名】即可直接修改项目；【转横屏/转竖屏】自动无损转换画布并智能匹配字幕安全区。")
 
             with gr.Row():
                 # 功能 1：图文/视频自动吸附
@@ -1739,44 +1899,111 @@ with gr.Blocks(title="智绘声影2.0+剪映自动视频工作台") as demo:
                     outputs=[title_result]
                 )
 
+            # --- 事件联动与刷新逻辑 ---
             def refresh_project_list(path):
                 clean_path = normalize_path(path)
                 projs = scan_jianying_projects(clean_path)
-                cur_cfg = load_config()
-                last_p = str(cur_cfg.get("last_selected_project", ""))
-                # 默认优先保留当前选择；如果当前没有或失效，首选排序第一的最新工程
-                chosen = last_p if last_p in projs else (projs[0] if projs else None)
+                # 刷新后直接置顶最新修改的项目
+                chosen = projs[0] if projs else None
                 save_config({"base_drafts_dir": clean_path, "last_selected_project": chosen or ""})
                 rec_y, rec_size, rec_scale, rec_stroke = inspect_draft_aspect_ratio(clean_path, chosen)
-                return gr.update(choices=projs, value=chosen), rec_y, rec_size, rec_scale, rec_stroke
+                return (
+                    gr.update(choices=projs, value=chosen),
+                    chosen or "",
+                    rec_y,
+                    rec_size,
+                    rec_scale,
+                    rec_stroke
+                )
 
             def on_proj_change(path, proj):
                 clean_path = normalize_path(path)
                 if proj is not None:
                     save_config({"base_drafts_dir": clean_path, "last_selected_project": str(proj)})
                 rec_y, rec_size, rec_scale, rec_stroke = inspect_draft_aspect_ratio(clean_path, proj)
-                return rec_y, rec_size, rec_scale, rec_stroke
+                return str(proj or ""), rec_y, rec_size, rec_scale, rec_stroke
 
-            # 刷新与联动
-            draft_path_input.change(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider])
-            refresh_btn.click(refresh_project_list, inputs=[draft_path_input], outputs=[project_dropdown, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider])
-            project_dropdown.change(on_proj_change, inputs=[draft_path_input, project_dropdown], outputs=[sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider])
+            # 目录改变或点击刷新 -> 自动置顶最新工程，同时同步更新重命名输入框和字幕预设
+            draft_path_input.change(
+                refresh_project_list,
+                inputs=[draft_path_input],
+                outputs=[project_dropdown, new_proj_name_input, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider]
+            )
+            refresh_btn.click(
+                refresh_project_list,
+                inputs=[draft_path_input],
+                outputs=[project_dropdown, new_proj_name_input, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider]
+            )
+            project_dropdown.change(
+                on_proj_change,
+                inputs=[draft_path_input, project_dropdown],
+                outputs=[new_proj_name_input, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider]
+            )
 
-            # 年份前缀按钮回调
+            # 1. 保存端口
+            def on_save_port(port_val):
+                try:
+                    p = int(port_val)
+                    if p < 1024 or p > 65535:
+                        return "❌ 端口范围应在 1024 - 65535 之间！"
+                    cur_cfg = load_config()
+                    cur_cfg["server_port"] = p
+                    save_config(cur_cfg)
+                    return f"✅ 端口设置已更新为 {p}！下次重新启动本工作台将自动在 127.0.0.1:{p} 开启并打开浏览器。"
+                except Exception as e:
+                    return f"❌ 端口格式错误: {e}"
+
+            save_port_btn.click(on_save_port, inputs=[port_input], outputs=[draft_rename_tip])
+
+            # 2. 直接重命名草稿工程
+            rename_proj_btn.click(
+                core_rename_draft_project,
+                inputs=[draft_path_input, project_dropdown, new_proj_name_input],
+                outputs=[project_dropdown, new_proj_name_input, draft_rename_tip]
+            )
+
+            # 3. 增删年份前缀
             def on_add_year(path, proj):
                 return core_modify_draft_year_prefix(path, proj, action="add")
 
             def on_remove_year(path, proj):
                 return core_modify_draft_year_prefix(path, proj, action="remove")
 
-            add_year_btn.click(on_add_year, inputs=[draft_path_input, project_dropdown], outputs=[project_dropdown, draft_rename_tip])
-            remove_year_btn.click(on_remove_year, inputs=[draft_path_input, project_dropdown], outputs=[project_dropdown, draft_rename_tip])
+            add_year_btn.click(
+                on_add_year,
+                inputs=[draft_path_input, project_dropdown],
+                outputs=[project_dropdown, new_proj_name_input, draft_rename_tip]
+            )
+            remove_year_btn.click(
+                on_remove_year,
+                inputs=[draft_path_input, project_dropdown],
+                outputs=[project_dropdown, new_proj_name_input, draft_rename_tip]
+            )
+
+            # 4. 横屏/竖屏独立转换按钮
+            def on_convert_to_landscape(path, proj):
+                return core_convert_draft_aspect(path, proj, target_aspect="horizontal")
+
+            def on_convert_to_portrait(path, proj):
+                return core_convert_draft_aspect(path, proj, target_aspect="vertical")
+
+            set_landscape_btn.click(
+                on_convert_to_landscape,
+                inputs=[draft_path_input, project_dropdown],
+                outputs=[project_dropdown, draft_rename_tip, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider]
+            )
+            set_portrait_btn.click(
+                on_convert_to_portrait,
+                inputs=[draft_path_input, project_dropdown],
+                outputs=[project_dropdown, draft_rename_tip, sub_y_slider, sub_size_slider, sub_scale_slider, sub_stroke_slider]
+            )
 
 # ==========================================
 # 5. 启动入口
 # ==========================================
 if __name__ == "__main__":
-    port = 7860
+    cfg = load_config()
+    port = int(cfg.get("server_port", 7860))
     if sys.platform == "win32":
         allowed_list = [f"{d}:\\" for d in "CDEFGHIJKLMNOPQRSTUVWXYZ" if os.path.exists(f"{d}:\\")]
     else:
