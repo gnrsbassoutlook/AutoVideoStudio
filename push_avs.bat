@@ -1,68 +1,133 @@
 @echo off
-chcp 65001 >nul
+setlocal EnableDelayedExpansion
+rem chcp removed for test
 cd /d "%~dp0"
+title AutoVideoStudio - Õ∆ÀÕµΩ GitHub
+
+rem ∞— Windows œµÕ≥ƒø¬ºÃ·µΩ PATH ◊Ó«∞, ∑¿÷π find / findstr ±ª Git Bash µƒÕ¨√˚≥Ã–Ú∂•ÃÊ
+set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%PATH%"
+
+rem ===================== ≈‰÷√«¯ =====================
+set "REPO_SSH=C:/Users/BD120C/AppData/Local/Temp/avsb2_bare.git"
+set "REPO_HTTPS=C:/Users/BD120C/AppData/Local/Temp/avsb2_bare.git"
+set "BRANCH=main"
+rem ==================================================
+
 echo ==========================================
-echo " üöÄ AutoVideoStudio GitHub Ëá™Âä®Êé®ÈÄÅËÑöÊú¨"
+echo   AutoVideoStudio  -  Õ∆ÀÕµΩ GitHub
 echo ==========================================
 
-:: ‰ºòÂÖàSSHÂú∞ÂùÄÔºåWindowsÈúÄË¶ÅÈÖçÁΩÆGit SSHÂØÜÈí•
-set REMOTE_SSH=git@github.com:gnrsbassoutlook/AutoVideoStudio.git
-:: Â¶ÇÊûú‰∏çÊÉ≥Áî®SSHÔºåÂèñÊ∂à‰∏ã‰∏ÄË°åÊ≥®ÈáäÔºåÊ≥®Èáä‰∏äÈù¢‰∏ÄË°å
-:: set REMOTE_SSH=https://github.com/gnrsbassoutlook/AutoVideoStudio.git
+git --version >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo   [¥ÌŒÛ] Œ¥ºÏ≤‚µΩ git, «Îœ»∞≤◊∞ Git for Windows.
+    echo.
+    pause
+    exit /b 1
+)
+
+rem ---- µ±«∞∑÷÷ß ----
+for /f "delims=" %%b in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set "CURB=%%b"
+if defined CURB if not "!CURB!"=="HEAD" set "BRANCH=!CURB!"
 
 if not exist ".git" (
-    echo üì¶ Ê≠£Âú®ÂàùÂßãÂåñ Git ‰ªìÂ∫ì...
+    echo.
+    echo   Œ¥ºÏ≤‚µΩ Git ≤÷ø‚, ’˝‘⁄≥ı ºªØ ...
     git init
-    git branch -M main
-    git remote add origin %REMOTE_SSH%
-)
-
-for /f "delims=" %%a in ('git remote get-url origin 2^>nul') do set REMOTE_URL=%%a
-if "!REMOTE_URL!"=="" (
-    git remote add origin %REMOTE_SSH%
-) else if NOT "!REMOTE_URL!"=="%REMOTE_SSH%" (
-    echo üîÑ Êõ¥Êñ∞originËøúÁ®ãÂú∞ÂùÄ‰∏∫: %REMOTE_SSH%
-    git remote set-url origin %REMOTE_SSH%
+    git branch -M !BRANCH!
 )
 
 echo.
-echo üìä ÂΩìÂâçÊñá‰ª∂ÊîπÂä®Áä∂ÊÄÅÔºö
-git status -s
-for /f "delims=" %%i in ('git status -s') do set STATUS_OUT=%%i
-
-echo.
-:: Â∑•‰ΩúÂå∫Êó†‰øÆÊîπÁõ¥Êé•ÈÄÄÂá∫Ôºå‰∏çÊâßË°åÊèê‰∫§Êé®ÈÄÅ
-if "!STATUS_OUT!"=="" (
-    echo ‚úÖ Ê£ÄÊµãÂà∞ working tree cleanÔºåÊ≤°ÊúâÊñá‰ª∂ÊîπÂä®ÔºåÊó†ÈúÄÊèê‰∫§Êé®ÈÄÅ„ÄÇ
-    echo.
-    pause >nul
-    exit /b
-)
-
-set "msg="
-set /p msg=üëâ ËØ∑ËæìÂÖ• Commit ËØ¥Êòé (Áõ¥Êé•ÂõûËΩ¶ÈªòËÆ§: Auto update):
-if "!msg!"=="" (
-    for /f %%a in ('powershell Get-Date -Format "yyyy-MM-dd HH:mm:ss"') do set msg=Auto update: %%a
-)
-
-echo.
-echo ‚è≥ Ê≠£Âú®Êèê‰∫§Âπ∂Êé®ÈÄÅÂà∞ GitHub...
-git add .
-git commit -m "!msg!" --allow-empty
-git push -u origin main
-if %errorlevel% equ 0 (
-    echo.
-    echo üéâ Êé®ÈÄÅÊàêÂäüÔºÅ‰ª£Á†ÅÂ∑≤ÂêåÊ≠•Ëá≥ GitHub„ÄÇ
+echo   [1/4] ºÏ≤‚‘∂≥ÃÕ®µ¿ ...
+set "REMOTE="
+git ls-remote "!REPO_SSH!" HEAD >nul 2>&1
+if not errorlevel 1 (
+    set "REMOTE=!REPO_SSH!"
+    echo         SSH ø…”√
 ) else (
-    echo.
-    echo ‚ö†Ô∏è Êé®ÈÄÅÂèØËÉΩÈÅáÂà∞ÂÜ≤Á™ÅÔºåÊ≠£Âú®Â∞ùËØïÊãâÂèñÂêàÂπ∂ÂêéÈáçÊñ∞Êé®ÈÄÅ...
-    git pull origin main --rebase
-    if %errorlevel% neq 0 (
-        echo ‚ùå rebaseÂêàÂπ∂Â§±Ë¥•ÔºåËØ∑ÊâãÂä®Ëß£ÂÜ≥ÂÜ≤Á™ÅÔºÅ
-    ) else (
-        git push -u origin main
+    set "REMOTE=!REPO_HTTPS!"
+    echo         SSH ≤ªø…”√, ◊‘∂ØªÿÕÀ HTTPS
+)
+
+git remote get-url origin >nul 2>&1
+if errorlevel 1 (
+    git remote add origin "!REMOTE!"
+) else (
+    for /f "delims=" %%u in ('git remote get-url origin') do set "CURU=%%u"
+    if /i not "!CURU!"=="!REMOTE!" (
+        echo         “—∏¸–¬ origin µÿ÷∑
+        git remote set-url origin "!REMOTE!"
     )
 )
 
 echo.
+echo   [2/4] ¿≠»°‘∂≥Ã◊Ó–¬◊¥Ã¨ ...
+git fetch origin !BRANCH! 2>nul
+set "BEHIND=0"
+for /f "delims=" %%c in ('git rev-list --count HEAD..origin/!BRANCH! 2^>nul') do set "BEHIND=%%c"
+if !BEHIND! GTR 0 (
+    echo         ±æµÿ¬‰∫Û !BEHIND! ∏ˆÃ·Ωª, œ»◊‘∂Ø±‰ª˘ ...
+    git pull --rebase --autostash origin !BRANCH!
+    if errorlevel 1 (
+        echo.
+        echo         ±‰ª˘ ß∞‹, «Î ÷∂Ø¥¶¿Ì≥ÂÕª∫Û÷ÿ ‘.
+        pause
+        exit /b 1
+    )
+)
+
+echo.
+echo   [3/4] µ±«∞∏ƒ∂Ø:
+echo   --------------------------------------------------------------
+git status -s
+echo   --------------------------------------------------------------
+
+set "HASCHG="
+for /f "delims=" %%i in ('git status --porcelain') do set "HASCHG=1"
+if not defined HASCHG (
+    echo.
+    echo   √ª”––Ë“™Ã·Ωªµƒ∏ƒ∂Ø, Œﬁ–ËÕ∆ÀÕ.
+    echo.
+    pause
+    exit /b 0
+)
+
+echo.
+set "MSG="
+set /p "MSG=  «Î ‰»Î Commit Àµ√˜ (÷±Ω”ªÿ≥µ = ◊‘∂Ø ±º‰¥¡): "
+if not defined MSG set "MSG=Auto update: !date! !time!"
+
+echo.
+echo   [4/4] Ã·Ωª≤¢Õ∆ÀÕµΩ !BRANCH! ...
+git add -A
+git commit -m "!MSG!"
+if errorlevel 1 (
+    echo.
+    echo   Ã·Ωª ß∞‹, “—Õ£÷π.
+    pause
+    exit /b 1
+)
+
+git push -u origin !BRANCH!
+if errorlevel 1 (
+    echo.
+    echo   Õ∆ÀÕ±ªæ‹æ¯, ≥¢ ‘¿≠»°∫œ≤¢∫Û÷ÿ ‘ ...
+    git pull --rebase --autostash origin !BRANCH!
+    if errorlevel 1 (
+        echo   ∫œ≤¢ ß∞‹, «Î ÷∂ØΩ‚æˆ≥ÂÕª.
+        pause
+        exit /b 1
+    )
+    git push -u origin !BRANCH!
+    if errorlevel 1 (
+        echo   Õ∆ÀÕ»‘»ª ß∞‹, «ÎºÏ≤ÈÕ¯¬ÁªÚ≤÷ø‚»®œﬁ.
+        pause
+        exit /b 1
+    )
+)
+
+echo.
+echo   Õ∆ÀÕ≥…π¶.
+echo.
 pause
+exit /b 0

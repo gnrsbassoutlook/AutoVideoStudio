@@ -1,7 +1,26 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
+
+# 本机配置（含个人路径，不入库）
 app_config.json
+
+# 备份文件
 *.backup_*
 *.bak_*
+
+# 运行时产物
+gradio_tmp/
+outputs/
+*.log
+
+# 虚拟环境
+venv/
+.venv/
+env/
+
+# 系统文件
 .DS_Store
+Thumbs.db
+desktop.ini
