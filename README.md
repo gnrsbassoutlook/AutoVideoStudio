@@ -39,3 +39,4 @@ Bash
 python3 app.py
 Mac 权限设置提示：
 在 Mac 终端运行一次 chmod +x start_mac.command，以后就可以直接双击此文件运行了。c1
+c2
