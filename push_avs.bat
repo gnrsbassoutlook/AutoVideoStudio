@@ -1,52 +1,52 @@
 @echo off
 setlocal EnableDelayedExpansion
-rem chcp removed for test
+chcp 65001 >nul 2>&1
 cd /d "%~dp0"
-title AutoVideoStudio - ÍÆËÍµ½ GitHub
+title AutoVideoStudio - æ¨é€åˆ° GitHub
 
-rem °Ñ Windows ÏµÍ³Ä¿Â¼Ìáµ½ PATH ×îÇ°, ·ÀÖ¹ find / findstr ±» Git Bash µÄÍ¬Ãû³ÌĞò¶¥Ìæ
+rem æŠŠ Windows ç³»ç»Ÿç›®å½•æåˆ° PATH æœ€å‰, é˜²æ­¢ find / findstr è¢« Git Bash çš„åŒåç¨‹åºé¡¶æ›¿
 set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%PATH%"
 
-rem ===================== ÅäÖÃÇø =====================
-set "REPO_SSH=C:/Users/BD120C/AppData/Local/Temp/avsb2_bare.git"
-set "REPO_HTTPS=C:/Users/BD120C/AppData/Local/Temp/avsb2_bare.git"
+rem ===================== é…ç½®åŒº =====================
+set "REPO_SSH=git@github.com:gnrsbassoutlook/AutoVideoStudio.git"
+set "REPO_HTTPS=https://github.com/gnrsbassoutlook/AutoVideoStudio.git"
 set "BRANCH=main"
 rem ==================================================
 
 echo ==========================================
-echo   AutoVideoStudio  -  ÍÆËÍµ½ GitHub
+echo   AutoVideoStudio  -  æ¨é€åˆ° GitHub
 echo ==========================================
 
 git --version >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo   [´íÎó] Î´¼ì²âµ½ git, ÇëÏÈ°²×° Git for Windows.
+    echo   [é”™è¯¯] æœªæ£€æµ‹åˆ° git, è¯·å…ˆå®‰è£… Git for Windows.
     echo.
     pause
     exit /b 1
 )
 
-rem ---- µ±Ç°·ÖÖ§ ----
+rem ---- å½“å‰åˆ†æ”¯ ----
 for /f "delims=" %%b in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set "CURB=%%b"
 if defined CURB if not "!CURB!"=="HEAD" set "BRANCH=!CURB!"
 
 if not exist ".git" (
     echo.
-    echo   Î´¼ì²âµ½ Git ²Ö¿â, ÕıÔÚ³õÊ¼»¯ ...
+    echo   æœªæ£€æµ‹åˆ° Git ä»“åº“, æ­£åœ¨åˆå§‹åŒ– ...
     git init
     git branch -M !BRANCH!
 )
 
 echo.
-echo   [1/4] ¼ì²âÔ¶³ÌÍ¨µÀ ...
+echo   [1/4] æ£€æµ‹è¿œç¨‹é€šé“ ...
 set "REMOTE="
 git ls-remote "!REPO_SSH!" HEAD >nul 2>&1
 if not errorlevel 1 (
     set "REMOTE=!REPO_SSH!"
-    echo         SSH ¿ÉÓÃ
+    echo         SSH å¯ç”¨
 ) else (
     set "REMOTE=!REPO_HTTPS!"
-    echo         SSH ²»¿ÉÓÃ, ×Ô¶¯»ØÍË HTTPS
+    echo         SSH ä¸å¯ç”¨, è‡ªåŠ¨å›é€€ HTTPS
 )
 
 git remote get-url origin >nul 2>&1
@@ -55,29 +55,29 @@ if errorlevel 1 (
 ) else (
     for /f "delims=" %%u in ('git remote get-url origin') do set "CURU=%%u"
     if /i not "!CURU!"=="!REMOTE!" (
-        echo         ÒÑ¸üĞÂ origin µØÖ·
+        echo         å·²æ›´æ–° origin åœ°å€
         git remote set-url origin "!REMOTE!"
     )
 )
 
 echo.
-echo   [2/4] À­È¡Ô¶³Ì×îĞÂ×´Ì¬ ...
+echo   [2/4] æ‹‰å–è¿œç¨‹æœ€æ–°çŠ¶æ€ ...
 git fetch origin !BRANCH! 2>nul
 set "BEHIND=0"
 for /f "delims=" %%c in ('git rev-list --count HEAD..origin/!BRANCH! 2^>nul') do set "BEHIND=%%c"
 if !BEHIND! GTR 0 (
-    echo         ±¾µØÂäºó !BEHIND! ¸öÌá½», ÏÈ×Ô¶¯±ä»ù ...
+    echo         æœ¬åœ°è½å !BEHIND! ä¸ªæäº¤, å…ˆè‡ªåŠ¨å˜åŸº ...
     git pull --rebase --autostash origin !BRANCH!
     if errorlevel 1 (
         echo.
-        echo         ±ä»ùÊ§°Ü, ÇëÊÖ¶¯´¦Àí³åÍ»ºóÖØÊÔ.
+        echo         å˜åŸºå¤±è´¥, è¯·æ‰‹åŠ¨å¤„ç†å†²çªåé‡è¯•.
         pause
         exit /b 1
     )
 )
 
 echo.
-echo   [3/4] µ±Ç°¸Ä¶¯:
+echo   [3/4] å½“å‰æ”¹åŠ¨:
 echo   --------------------------------------------------------------
 git status -s
 echo   --------------------------------------------------------------
@@ -86,7 +86,7 @@ set "HASCHG="
 for /f "delims=" %%i in ('git status --porcelain') do set "HASCHG=1"
 if not defined HASCHG (
     echo.
-    echo   Ã»ÓĞĞèÒªÌá½»µÄ¸Ä¶¯, ÎŞĞèÍÆËÍ.
+    echo   æ²¡æœ‰éœ€è¦æäº¤çš„æ”¹åŠ¨, æ— éœ€æ¨é€.
     echo.
     pause
     exit /b 0
@@ -94,16 +94,16 @@ if not defined HASCHG (
 
 echo.
 set "MSG="
-set /p "MSG=  ÇëÊäÈë Commit ËµÃ÷ (Ö±½Ó»Ø³µ = ×Ô¶¯Ê±¼ä´Á): "
+set /p "MSG=  è¯·è¾“å…¥ Commit è¯´æ˜ (ç›´æ¥å›è½¦ = è‡ªåŠ¨æ—¶é—´æˆ³): "
 if not defined MSG set "MSG=Auto update: !date! !time!"
 
 echo.
-echo   [4/4] Ìá½»²¢ÍÆËÍµ½ !BRANCH! ...
+echo   [4/4] æäº¤å¹¶æ¨é€åˆ° !BRANCH! ...
 git add -A
 git commit -m "!MSG!"
 if errorlevel 1 (
     echo.
-    echo   Ìá½»Ê§°Ü, ÒÑÍ£Ö¹.
+    echo   æäº¤å¤±è´¥, å·²åœæ­¢.
     pause
     exit /b 1
 )
@@ -111,23 +111,23 @@ if errorlevel 1 (
 git push -u origin !BRANCH!
 if errorlevel 1 (
     echo.
-    echo   ÍÆËÍ±»¾Ü¾ø, ³¢ÊÔÀ­È¡ºÏ²¢ºóÖØÊÔ ...
+    echo   æ¨é€è¢«æ‹’ç», å°è¯•æ‹‰å–åˆå¹¶åé‡è¯• ...
     git pull --rebase --autostash origin !BRANCH!
     if errorlevel 1 (
-        echo   ºÏ²¢Ê§°Ü, ÇëÊÖ¶¯½â¾ö³åÍ».
+        echo   åˆå¹¶å¤±è´¥, è¯·æ‰‹åŠ¨è§£å†³å†²çª.
         pause
         exit /b 1
     )
     git push -u origin !BRANCH!
     if errorlevel 1 (
-        echo   ÍÆËÍÈÔÈ»Ê§°Ü, Çë¼ì²éÍøÂç»ò²Ö¿âÈ¨ÏŞ.
+        echo   æ¨é€ä»ç„¶å¤±è´¥, è¯·æ£€æŸ¥ç½‘ç»œæˆ–ä»“åº“æƒé™.
         pause
         exit /b 1
     )
 )
 
 echo.
-echo   ÍÆËÍ³É¹¦.
+echo   æ¨é€æˆåŠŸ.
 echo.
 pause
 exit /b 0

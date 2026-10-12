@@ -1,15 +1,15 @@
 @echo off
 setlocal EnableDelayedExpansion
-rem chcp removed for test
+chcp 65001 >nul 2>&1
 cd /d "%~dp0"
-title AutoVideoStudio - ´Ó GitHub À­È¡
+title AutoVideoStudio - ä»Ž GitHub æ‹‰å–
 
-rem °Ñ Windows ÏµÍ³Ä¿Â¼Ìáµ½ PATH ×îÇ°, ·ÀÖ¹ find / findstr ±» Git Bash µÄÍ¬Ãû³ÌÐò¶¥Ìæ
+rem æŠŠ Windows ç³»ç»Ÿç›®å½•æåˆ° PATH æœ€å‰, é˜²æ­¢ find / findstr è¢« Git Bash çš„åŒåç¨‹åºé¡¶æ›¿
 set "PATH=%SystemRoot%\System32;%SystemRoot%;%SystemRoot%\System32\Wbem;%PATH%"
 
-rem ===================== ÅäÖÃÇø =====================
-set "REPO_SSH=C:/Users/BD120C/AppData/Local/Temp/avsb2_bare.git"
-set "REPO_HTTPS=C:/Users/BD120C/AppData/Local/Temp/avsb2_bare.git"
+rem ===================== é…ç½®åŒº =====================
+set "REPO_SSH=git@github.com:gnrsbassoutlook/AutoVideoStudio.git"
+set "REPO_HTTPS=https://github.com/gnrsbassoutlook/AutoVideoStudio.git"
 set "BRANCH=main"
 set "LIST_MAX=20"
 rem ==================================================
@@ -18,13 +18,13 @@ set "TMPL=%TEMP%\avs_remote_list.txt"
 set "TMPS=%TEMP%\avs_remote_sha.txt"
 
 echo ==========================================
-echo   AutoVideoStudio  -  ´Ó GitHub À­È¡
+echo   AutoVideoStudio  -  ä»Ž GitHub æ‹‰å–
 echo ==========================================
 
 git --version >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo   [´íÎó] Î´¼ì²âµ½ git, ÇëÏÈ°²×° Git for Windows.
+    echo   [é”™è¯¯] æœªæ£€æµ‹åˆ° git, è¯·å…ˆå®‰è£… Git for Windows.
     echo.
     pause
     exit /b 1
@@ -32,7 +32,7 @@ if errorlevel 1 (
 
 if not exist ".git" (
     echo.
-    echo   [´íÎó] µ±Ç°Ä¿Â¼²»ÊÇ Git ²Ö¿â, ÇëÏÈ git clone.
+    echo   [é”™è¯¯] å½“å‰ç›®å½•ä¸æ˜¯ Git ä»“åº“, è¯·å…ˆ git clone.
     echo.
     pause
     exit /b 1
@@ -42,15 +42,15 @@ for /f "delims=" %%b in ('git rev-parse --abbrev-ref HEAD 2^>nul') do set "CURB=
 if defined CURB if not "!CURB!"=="HEAD" set "BRANCH=!CURB!"
 
 echo.
-echo   ¼ì²âÔ¶³ÌÍ¨µÀ ...
+echo   æ£€æµ‹è¿œç¨‹é€šé“ ...
 set "REMOTE="
 git ls-remote "!REPO_SSH!" HEAD >nul 2>&1
 if not errorlevel 1 (
     set "REMOTE=!REPO_SSH!"
-    echo         SSH ¿ÉÓÃ
+    echo         SSH å¯ç”¨
 ) else (
     set "REMOTE=!REPO_HTTPS!"
-    echo         SSH ²»¿ÉÓÃ, ×Ô¶¯»ØÍË HTTPS
+    echo         SSH ä¸å¯ç”¨, è‡ªåŠ¨å›žé€€ HTTPS
 )
 
 git remote get-url origin >nul 2>&1
@@ -59,27 +59,27 @@ if errorlevel 1 (
 ) else (
     for /f "delims=" %%u in ('git remote get-url origin') do set "CURU=%%u"
     if /i not "!CURU!"=="!REMOTE!" (
-        echo         ÒÑ¸üÐÂ origin µØÖ·
+        echo         å·²æ›´æ–° origin åœ°å€
         git remote set-url origin "!REMOTE!"
     )
 )
 
 echo.
-echo   ÕýÔÚ»ñÈ¡Ô¶³Ì×îÐÂÌá½» ...
+echo   æ­£åœ¨èŽ·å–è¿œç¨‹æœ€æ–°æäº¤ ...
 git fetch origin !BRANCH! 2>nul
 if errorlevel 1 (
-    echo   »ñÈ¡Ê§°Ü, Çë¼ì²éÍøÂç»ò²Ö¿âÈ¨ÏÞ.
+    echo   èŽ·å–å¤±è´¥, è¯·æ£€æŸ¥ç½‘ç»œæˆ–ä»“åº“æƒé™.
     pause
     exit /b 1
 )
 
 git log --pretty=format:"%%h   %%ad   %%an   %%s" --date=format:"%%m-%%d %%H:%%M" -n !LIST_MAX! "origin/!BRANCH!" > "%TMPL%"
-git log --pretty=format:"%%h" -n !LIST_MAX! "origin/!BRANCH!" > "%TMPS%"
+git log --pretty=format:"%%h" -n !LIST_MAX! "origin/!BRANCH!" | findstr /n "^" > "%TMPS%"
 
 set "CNT=0"
-for /f "usebackq delims=" %%x in (`findstr /n "^" "%TMPS%"`) do set /a CNT+=1
+for /f "usebackq delims=" %%x in ("%TMPS%") do set /a CNT+=1
 if !CNT! EQU 0 (
-    echo   Ô¶³ÌÃ»ÓÐÌá½»¼ÇÂ¼.
+    echo   è¿œç¨‹æ²¡æœ‰æäº¤è®°å½•.
     pause
     exit /b 1
 )
@@ -87,56 +87,59 @@ if !CNT! EQU 0 (
 for /f "delims=" %%h in ('git rev-parse --short HEAD 2^>nul') do set "NOW=%%h"
 
 echo.
-echo   Ô¶³Ì origin/!BRANCH! ×î½ü !CNT! ÌõÌá½»  (1 = ×îÐÂ)
+echo   è¿œç¨‹ origin/!BRANCH! æœ€è¿‘ !CNT! æ¡æäº¤  (1 = æœ€æ–°)
 echo   --------------------------------------------------------------
 findstr /n "^" "%TMPL%"
+echo.
 echo   --------------------------------------------------------------
 
 set "CURIDX="
-for /f "tokens=1,2 delims=:" %%i in ('findstr /n "^" "%TMPS%"') do (
+for /f "usebackq tokens=1,2 delims=:" %%i in ("%TMPS%") do (
     if "%%j"=="!NOW!" set "CURIDX=%%i"
 )
 echo.
-echo   ±¾µØµ±Ç°: !NOW!
+echo   æœ¬åœ°å½“å‰: !NOW!
 if defined CURIDX (
-    echo              = ÉÏÃæµÚ !CURIDX! Ìõ
+    echo              = ä¸Šé¢ç¬¬ !CURIDX! æ¡
 ) else (
-    echo              (²»ÔÚÔ¶³ÌÇ° !CNT! ÌõÖ®ÄÚ)
+    echo              (ä¸åœ¨è¿œç¨‹å‰ !CNT! æ¡ä¹‹å†…)
 )
 
 echo.
 set "PICK="
-set /p "PICK=  ÇëÊäÈëÐòºÅ 1-!CNT! (»Ø³µ = 1 ×îÐÂ, Q = È¡Ïû): "
+set /p "PICK=  è¯·è¾“å…¥åºå· 1-!CNT! (å›žè½¦ = 1 æœ€æ–°, Q = å–æ¶ˆ): "
 if /i "!PICK!"=="Q" goto CANCEL
 if not defined PICK set "PICK=1"
 
 echo !PICK!| findstr /r "^[1-9][0-9]*$" >nul
 if errorlevel 1 (
-    echo   ÊäÈëÎÞÐ§, Ö»ÄÜÊäÈë 1 µ½ !CNT! Ö®¼äµÄÊý×Ö.
+    echo   è¾“å…¥æ— æ•ˆ, åªèƒ½è¾“å…¥ 1 åˆ° !CNT! ä¹‹é—´çš„æ•°å­—.
     pause
     exit /b 1
 )
 if !PICK! GTR !CNT! (
-    echo   ³¬³ö·¶Î§, Ö»ÄÜÊäÈë 1 µ½ !CNT! Ö®¼äµÄÊý×Ö.
+    echo   è¶…å‡ºèŒƒå›´, åªèƒ½è¾“å…¥ 1 åˆ° !CNT! ä¹‹é—´çš„æ•°å­—.
     pause
     exit /b 1
 )
 
 set "TARGET="
-for /f "tokens=1,2 delims=:" %%i in ('findstr /b "!PICK!:" "%TMPS%"') do set "TARGET=%%j"
+for /f "usebackq tokens=1,2 delims=:" %%i in ("%TMPS%") do (
+    if "%%i"=="!PICK!" set "TARGET=%%j"
+)
 if not defined TARGET (
-    echo   ½âÎöÌá½»Ê§°Ü.
+    echo   è§£æžæäº¤å¤±è´¥.
     pause
     exit /b 1
 )
 
 echo.
-echo   ÒÑÑ¡Ôñ:
-findstr /b "!PICK!:" "%TMPL%"
+echo   å·²é€‰æ‹©:
+findstr /n "^" "%TMPL%" | findstr /b "!PICK!:"
 echo.
 
 if "!TARGET!"=="!NOW!" (
-    echo   ±¾µØÒÑ¾­Í£ÔÚÕâ¸öÌá½»ÉÏ, ÎÞÐè¸üÐÂ.
+    echo   æœ¬åœ°å·²ç»åœåœ¨è¿™ä¸ªæäº¤ä¸Š, æ— éœ€æ›´æ–°.
     goto ENDIT
 )
 
@@ -145,53 +148,53 @@ for /f "delims=" %%o in ('git rev-parse --short HEAD') do set "OLD=%%o"
 set "DIRTY="
 for /f "delims=" %%s in ('git status --porcelain') do set "DIRTY=1"
 if defined DIRTY (
-    echo   ¼ì²âµ½±¾µØÓÐÎ´Ìá½»¸Ä¶¯, ÕýÔÚ×Ô¶¯ stash ÔÝ´æ ...
+    echo   æ£€æµ‹åˆ°æœ¬åœ°æœ‰æœªæäº¤æ”¹åŠ¨, æ­£åœ¨è‡ªåŠ¨ stash æš‚å­˜ ...
     git stash push -u -m "avs-autostash"
     if errorlevel 1 (
-        echo   stash Ê§°Ü, ÒÑÈ¡Ïû¸üÐÂ.
+        echo   stash å¤±è´¥, å·²å–æ¶ˆæ›´æ–°.
         pause
         exit /b 1
     )
-    echo   ÒÑ´æÎª stash, ÐèÒªÈ¡»ØÊ±Ö´ÐÐ: git stash pop
+    echo   å·²å­˜ä¸º stash, éœ€è¦å–å›žæ—¶æ‰§è¡Œ: git stash pop
     echo.
 )
 
 git merge-base --is-ancestor HEAD !TARGET!
 if not errorlevel 1 (
-    echo   ¿ì½øÍ¬²½µ½ !TARGET! ...
+    echo   å¿«è¿›åŒæ­¥åˆ° !TARGET! ...
     git merge --ff-only !TARGET!
 ) else (
-    echo   [¾¯¸æ] ËùÑ¡Ìá½»²»ÔÚ±¾µØÀúÊ·Ç°·½, Í¬²½»á¶ªÆú±¾µØ¶à³öµÄÌá½».
+    echo   [è­¦å‘Š] æ‰€é€‰æäº¤ä¸åœ¨æœ¬åœ°åŽ†å²å‰æ–¹, åŒæ­¥ä¼šä¸¢å¼ƒæœ¬åœ°å¤šå‡ºçš„æäº¤.
     set "ANS="
-    set /p "ANS=  È·ÈÏÇëÊäÈë YES (ÆäËüÈÎÒâÄÚÈÝÈ¡Ïû): "
+    set /p "ANS=  ç¡®è®¤è¯·è¾“å…¥ YES (å…¶å®ƒä»»æ„å†…å®¹å–æ¶ˆ): "
     if /i not "!ANS!"=="YES" goto CANCEL
     git reset --hard !TARGET!
 )
 
 if errorlevel 1 (
     echo.
-    echo   Í¬²½Ê§°Ü, Çë¼ì²éÊÇ·ñ´æÔÚ³åÍ».
+    echo   åŒæ­¥å¤±è´¥, è¯·æ£€æŸ¥æ˜¯å¦å­˜åœ¨å†²çª.
     pause
     exit /b 1
 )
 
 echo.
-echo   Í¬²½Íê³É.
+echo   åŒæ­¥å®Œæˆ.
 echo   --------------------------------------------------------------
-echo   ¸üÐÂÇ°: !OLD!
-echo   ¸üÐÂºó: !TARGET!
+echo   æ›´æ–°å‰: !OLD!
+echo   æ›´æ–°åŽ: !TARGET!
 echo.
-echo   ±¾´Î±ä¶¯µÄÎÄ¼þ:
+echo   æœ¬æ¬¡å˜åŠ¨çš„æ–‡ä»¶:
 git diff --name-status !OLD! !TARGET!
 echo   --------------------------------------------------------------
 
 if exist "requirements.txt" (
     echo.
     set "DEP="
-    set /p "DEP=  ÊÇ·ñÍ¬Ê±¸üÐÂ Python ÒÀÀµ? (Y/n): "
+    set /p "DEP=  æ˜¯å¦åŒæ—¶æ›´æ–° Python ä¾èµ–? (Y/n): "
     if /i not "!DEP!"=="n" (
         echo.
-        echo   ÕýÔÚ¸üÐÂÒÀÀµ ...
+        echo   æ­£åœ¨æ›´æ–°ä¾èµ– ...
         if exist "venv\Scripts\pip.exe" (
             venv\Scripts\pip.exe install -r requirements.txt -q
         ) else if exist ".venv\Scripts\pip.exe" (
@@ -206,7 +209,7 @@ goto ENDIT
 
 :CANCEL
 echo.
-echo   ÒÑÈ¡Ïû, ±¾µØ´úÂëÎ´×öÈÎºÎ¸Ä¶¯.
+echo   å·²å–æ¶ˆ, æœ¬åœ°ä»£ç æœªåšä»»ä½•æ”¹åŠ¨.
 
 :ENDIT
 del "%TMPL%" >nul 2>&1
